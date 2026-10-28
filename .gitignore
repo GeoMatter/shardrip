@@ -1,0 +1,18 @@
+# Download state / partial files
+*.state
+*.state.tmp
+
+# Downloaded files (don't commit test downloads)
+*.iso
+*.zip
+*.tar.*
+*.tgz
+*.7z
+*.exe
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
