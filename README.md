@@ -35,6 +35,14 @@ python shardrip.py
 ========================================================
   ⚡ SHARDRIP - multi-connection downloader
 ========================================================
+  1) Download a file
+  2) Send a file to someone
+  Choose [1]:
+```
+
+**1) Download a file** asks:
+
+```
   Download URL: https://example.com/big-file.iso
   Extra mirror URL (Enter to skip):
   Save folder (B = browse) [C:\Users\you\Downloads]:
@@ -43,7 +51,17 @@ python shardrip.py
   SHA256 to verify (Enter to skip):
 ```
 
-Press **Enter** to accept a default. Type **B** at the folder prompt to open a folder picker.
+**2) Send a file to someone** asks:
+
+```
+  File to send (drag it in, or B = browse): C:\Users\you\Videos\clip.mp4
+  Port [8080]:
+  Public internet link via Cloudflare? (Y/n) [y]:
+```
+
+Then it prints a link to give the receiver. See [Send a file to someone](#send-a-file-to-someone).
+
+Press **Enter** to accept a default. Type **B** to open a folder or file picker.
 
 ### Command line
 
@@ -58,6 +76,7 @@ python shardrip.py URL [MIRROR2 MIRROR3 ...] -o FILE -c 16 --sha256 HASH
 | `-c`, `--connections` | Parallel connections | 16 |
 | `--chunk-mb` | Chunk size in MB | 16 |
 | `--sha256` | Expected SHA256 hash to verify at the end | none |
+| `--overwrite` | Replace an existing file without asking | off (asks first) |
 
 **Example: Kali Linux ISO**
 
@@ -129,6 +148,7 @@ Quick test: download with `-c 1`, then `-c 16`, and compare the speeds.
 - Press **Ctrl+C**. Progress is saved after every chunk.
 - Run the same command again, or use the same URL and save location in interactive mode, and it continues from where it stopped.
 - Until it finishes, the output file shows its **full size** because it's pre-allocated. **Don't open or use it until you see `Done`.**
+- **A finished file is never overwritten by accident.** If the file already exists, Shardrip checks it against `--sha256` (if given) and skips the download when it matches. Otherwise it asks before replacing it.
 
 ## Limitations
 
