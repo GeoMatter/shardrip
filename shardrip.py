@@ -50,7 +50,7 @@ except ImportError:  # first run on a fresh machine: install it automatically
     import requests
 
 READ_SIZE = 256 * 1024
-UA = {"User-Agent": "shardrip/1.1"}
+UA = {"User-Agent": "shardrip/1.2"}
 _local = threading.local()
 
 CLOUDFLARED_BASE = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
@@ -551,6 +551,7 @@ def main():
     ap.add_argument("-c", "--connections", type=int, default=16, help="parallel connections (default 16)")
     ap.add_argument("--chunk-mb", type=int, default=16, help="chunk size in MB (default 16)")
     ap.add_argument("--sha256", help="expected SHA256 to verify at the end")
+    ap.add_argument("--overwrite", action="store_true", help="replace an existing output file without asking")
     ap.add_argument("--serve", metavar="FILE", help="SEND mode: share FILE so someone else can download it")
     ap.add_argument("--port", type=int, default=8080, help="port for --serve (default 8080)")
     ap.add_argument("--no-tunnel", action="store_true", help="--serve without the public Cloudflare link (LAN/Tailscale only)")
@@ -578,6 +579,24 @@ def main():
             print(f"Skipping mirror ({e}): {u}")
 
     print(f"File: {out}  Size: {human(size)}  Mirrors: {len(urls)}  Connections: {a.connections}")
+
+    # Never silently wipe a file that's already there (e.g. a finished download).
+    # A .state file next to it means it's a resumable partial download, which is fine.
+    if os.path.exists(out) and not os.path.exists(state_path) and not getattr(a, "overwrite", False):
+        print(f"\n⚠️  {out} already exists ({human(os.path.getsize(out))}).")
+        if a.sha256:
+            print("Checking whether it's already complete...")
+            if sha256_file(out).lower() == a.sha256.lower():
+                print("It's already fully downloaded and the SHA256 matches ✅ - nothing to do.")
+                return
+            print("Its SHA256 doesn't match, so it's incomplete or a different file.")
+        try:
+            ans = input("Overwrite it? (y/N): ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("Cancelled - existing file left untouched. (Use -o to save under another name.)")
+            return
 
     if not ranges or size == 0:
         single_stream(urls[0], out, size)
