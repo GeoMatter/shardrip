@@ -16,6 +16,7 @@ It does the same job as paid "download accelerators", with no ads, no installer 
 - **SHA256 verification:** confirms the download isn't corrupted or tampered with
 - **Interactive mode:** double-click and answer the prompts, no command line needed
 - **Auto-fallback:** servers without Range support are downloaded over a single connection
+- **Send mode:** share a file from your PC with a public link, with no port forwarding, even behind CGNAT
 - **One file:** the only dependency is `requests`, which installs itself on first run
 
 ## Quick start
@@ -66,6 +67,46 @@ python shardrip.py "https://cdimage.kali.org/kali-2026.3/kali-linux-2026.3-insta
   --sha256 db9cbed33edb45727d16911813c2434fcd1419585007884153be22a03b30ec2f
 ```
 
+## Send a file to someone
+
+Shardrip can also **send**. It shares a file straight from your PC, and the receiver downloads it with Shardrip over parallel connections, with automatic SHA256 verification.
+
+```bash
+python shardrip.py --serve "C:\path\to\file.iso"
+```
+
+Or run it interactively and choose **2) Send a file to someone**.
+
+```
+================================================================
+  ⚡ SHARING - send the receiver one of these links:
+================================================================
+  Internet (public link):
+    https://random-words.trycloudflare.com/Xk3.../file.iso
+  Same network (LAN):
+    http://192.168.1.50:8080/Xk3.../file.iso
+
+  SHA256: db9cbed3...
+
+  Receiver runs:
+    python shardrip.py "https://random-words.trycloudflare.com/Xk3.../file.iso" --sha256 db9cbed3...
+================================================================
+```
+
+**How it works over the internet:** Shardrip starts a small file server on your PC and opens a free [Cloudflare Quick Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/). Your PC connects *out* to Cloudflare, so you need **no port forwarding, no router changes and no account**, and it works behind CGNAT. `cloudflared` (Cloudflare's official tunnel client) is downloaded automatically from its GitHub releases on first use.
+
+| Option | Description | Default |
+|---|---|---|
+| `--serve FILE` | Share FILE | none |
+| `--port` | Local port for the file server | 8080 |
+| `--no-tunnel` | No public link: LAN (and Tailscale, if installed) only | off |
+
+**Good to know:**
+- **Your upload speed is the limit.** Many home plans upload much slower than they download, and no number of connections can beat that.
+- **The link contains a random secret path**, so it can't be guessed. But **anyone you give the link to can download the file while the window is open.** Close the window or press Ctrl+C to stop sharing.
+- **Quick Tunnels are a free Cloudflare service with no uptime guarantee.** They're great for one-off transfers. If the tunnel won't start, the LAN and Tailscale links still work.
+- **Tailscale:** if it's installed, a Tailscale link is shown too, as a private alternative to the public link.
+
 ## How it works
 
 1. **Probe:** asks the server for the file size and checks it supports HTTP Range requests.
@@ -91,7 +132,7 @@ Quick test: download with `-c 1`, then `-c 16`, and compare the speeds.
 
 ## Limitations
 
-- Works with direct HTTP/HTTPS file links only. It doesn't work with streaming sites, torrents, or game launchers like Steam (which already download in parallel).
+- Downloads work with direct HTTP/HTTPS file links only. It doesn't work with streaming sites, torrents, or game launchers like Steam (which already download in parallel).
 - Every mirror must serve the **exact same file**. Mirrors with a different size are skipped automatically.
 - Please be considerate: don't hammer small or free servers with a large number of connections.
 

@@ -11,6 +11,11 @@
 *.exe
 *.bin
 
+# cloudflared binary (auto-downloaded by send mode)
+cloudflared
+cloudflared.exe
+cloudflared*.part
+
 # Python
 __pycache__/
 *.pyc

@@ -11,32 +11,58 @@ How it works:
   5. Finished chunks are recorded in <file>.state so you can resume.
   6. Optional SHA256 check at the end.
 
+Send mode (--serve):
+  Shares one file from your PC over a Range-capable HTTP server. By default it also
+  opens a free Cloudflare Quick Tunnel, so you get a public https link that works over
+  the internet with no port forwarding (works behind CGNAT too). The receiver downloads
+  it with Shardrip using parallel connections, plus automatic SHA256 verification.
+
 Usage:
   Interactive:  double-click shardrip.py (or run: python shardrip.py) and answer the prompts
-  Command line: python shardrip.py URL [MIRROR2 ...] -o kali.iso -c 16 --sha256 <hash>
+  Download:     python shardrip.py URL [MIRROR2 ...] -o kali.iso -c 16 --sha256 <hash>
+  Send:         python shardrip.py --serve "C:\\path\\to\\file.iso" [--port 8080] [--no-tunnel]
 
 Resume: run it again with the same URL + save location; finished chunks are skipped.
 """
 import argparse
 import hashlib
+import http.server
 import json
 import os
+import platform
+import queue
+import re
+import secrets
+import shutil
+import socket
+import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 try:
     import requests
 except ImportError:  # first run on a fresh machine: install it automatically
-    import subprocess
     print("Installing 'requests' (one-time)...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
     import requests
 
 READ_SIZE = 256 * 1024
-UA = {"User-Agent": "shardrip/1.0"}
+UA = {"User-Agent": "shardrip/1.1"}
 _local = threading.local()
+
+CLOUDFLARED_BASE = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+CLOUDFLARED_ASSETS = {
+    ("Windows", "amd64"): "cloudflared-windows-amd64.exe",
+    ("Windows", "x86_64"): "cloudflared-windows-amd64.exe",
+    ("Windows", "arm64"): "cloudflared-windows-amd64.exe",  # runs under emulation
+    ("Linux", "x86_64"): "cloudflared-linux-amd64",
+    ("Linux", "amd64"): "cloudflared-linux-amd64",
+    ("Linux", "aarch64"): "cloudflared-linux-arm64",
+    ("Linux", "arm64"): "cloudflared-linux-arm64",
+}
 
 
 def session():
@@ -146,6 +172,273 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+# ----------------------------------------------------------------------------
+# Send mode: share a file over HTTP (with Range support) + optional public tunnel
+# ----------------------------------------------------------------------------
+
+def lan_ip():
+    """Best-guess LAN IP (no packets are actually sent)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return "127.0.0.1"
+
+
+def tailscale_ip():
+    """Tailscale IPv4 if Tailscale is installed and connected, else None."""
+    exe = shutil.which("tailscale")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=5)
+        ip = out.stdout.strip().splitlines()[0] if out.returncode == 0 and out.stdout.strip() else None
+        return ip
+    except (OSError, subprocess.SubprocessError, IndexError):
+        return None
+
+
+def find_cloudflared():
+    """Find cloudflared on PATH or next to this script; download it from GitHub if missing."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    is_win = platform.system() == "Windows"
+    local = os.path.join(here, "cloudflared.exe" if is_win else "cloudflared")
+    found = shutil.which("cloudflared") or (local if os.path.isfile(local) else None)
+    if found:
+        return found
+
+    asset = CLOUDFLARED_ASSETS.get((platform.system(), platform.machine().lower()))
+    if not asset:
+        print("    ↳ No automatic cloudflared download for this OS. Install it from")
+        print("      https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/")
+        return None
+
+    print("Downloading cloudflared (one-time, ~40 MB, official Cloudflare release from GitHub)...")
+    try:
+        with requests.get(CLOUDFLARED_BASE + asset, stream=True, timeout=60, headers=UA) as r:
+            r.raise_for_status()
+            tmp = local + ".part"
+            with open(tmp, "wb") as f:
+                for block in r.iter_content(READ_SIZE):
+                    f.write(block)
+        os.replace(tmp, local)
+        if not is_win:
+            os.chmod(local, 0o755)
+        return local
+    except Exception as e:
+        print(f"    ↳ Couldn't download cloudflared: {e}")
+        return None
+
+
+def start_tunnel(port, timeout=60):
+    """Start a Cloudflare Quick Tunnel to localhost:port. Returns (process, public_url) or (None, None)."""
+    exe = find_cloudflared()
+    if not exe:
+        return None, None
+    proc = subprocess.Popen(
+        [exe, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        encoding="utf-8", errors="replace",
+    )
+    found = queue.Queue()
+
+    def drain():
+        # Keep reading forever: if the pipe fills up, cloudflared would stall.
+        sent = False
+        for line in proc.stdout:
+            if not sent:
+                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                if m:
+                    found.put(m.group(0))
+                    sent = True
+        if not sent:
+            found.put(None)
+
+    threading.Thread(target=drain, daemon=True).start()
+    try:
+        url = found.get(timeout=timeout)
+    except queue.Empty:
+        url = None
+    if not url:
+        proc.terminate()
+        return None, None
+    return proc, url
+
+
+class ServeStats:
+    def __init__(self):
+        self.sent = 0
+        self.active = 0
+        self.lock = threading.Lock()
+        self.t0 = time.time()
+        self.last_sent, self.last_t = 0, time.time()
+
+    def add(self, n):
+        with self.lock:
+            self.sent += n
+
+    def conn(self, delta):
+        with self.lock:
+            self.active += delta
+
+    def line(self):
+        now = time.time()
+        with self.lock:
+            sent, active = self.sent, self.active
+        speed = (sent - self.last_sent) / max(now - self.last_t, 1e-6)
+        self.last_sent, self.last_t = sent, now
+        return f"\r  Sent {human(sent)}  |  {human(speed)}/s  |  {active} active connection(s)  |  Ctrl+C to stop   "
+
+
+def make_handler(file_path, url_path, size, name, stats):
+    quoted_name = urllib.parse.quote(name)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "shardrip"
+        sys_version = ""
+
+        def log_message(self, *args):  # keep the console clean
+            pass
+
+        def do_HEAD(self):
+            self.respond(head=True)
+
+        def do_GET(self):
+            self.respond(head=False)
+
+        def error(self, code, extra=None):
+            self.send_response(code)
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def respond(self, head):
+            # Only the exact secret path is served; everything else is 404.
+            if urllib.parse.unquote(self.path.split("?")[0]) != url_path:
+                return self.error(404)
+
+            start, end, status = 0, size - 1, 200
+            rng = self.headers.get("Range")
+            if rng:
+                m = re.fullmatch(r"\s*bytes=(\d*)-(\d*)\s*", rng)
+                if not m or (m.group(1) == "" and m.group(2) == ""):
+                    return self.error(416, {"Content-Range": f"bytes */{size}"})
+                if m.group(1) == "":  # suffix range: last N bytes
+                    start = max(0, size - int(m.group(2)))
+                else:
+                    start = int(m.group(1))
+                    if m.group(2):
+                        end = min(int(m.group(2)), size - 1)
+                if start >= size or start > end:
+                    return self.error(416, {"Content-Range": f"bytes */{size}"})
+                status = 206
+
+            length = end - start + 1
+            self.send_response(status)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quoted_name}")
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            if head:
+                return
+
+            stats.conn(+1)
+            try:
+                with open(file_path, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        data = f.read(min(READ_SIZE, remaining))
+                        if not data:
+                            break
+                        self.wfile.write(data)
+                        remaining -= len(data)
+                        stats.add(len(data))
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass  # receiver closed the connection (normal on cancel/retry)
+            finally:
+                stats.conn(-1)
+
+    return Handler
+
+
+def serve(file_path, port=8080, tunnel=True):
+    file_path = os.path.abspath(file_path)
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+    name = os.path.basename(file_path)
+    size = os.path.getsize(file_path)
+
+    print(f"File: {name}  ({human(size)})")
+    print("Hashing (SHA256) so the receiver can verify the download...")
+    digest = sha256_file(file_path)
+
+    token = secrets.token_urlsafe(9)  # secret path: the link can't be guessed
+    url_path = f"/{token}/{name}"
+    link_path = f"/{token}/{urllib.parse.quote(name)}"
+
+    stats = ServeStats()
+    try:
+        server = http.server.ThreadingHTTPServer(("0.0.0.0", port), make_handler(file_path, url_path, size, name, stats))
+    except OSError as e:
+        raise OSError(f"Port {port} is in use or blocked ({e}). Try a different port with --port.")
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    links = [("Same network (LAN)", f"http://{lan_ip()}:{port}{link_path}")]
+    ts = tailscale_ip()
+    if ts:
+        links.append(("Tailscale", f"http://{ts}:{port}{link_path}"))
+
+    tunnel_proc = None
+    if tunnel:
+        print("Opening a public Cloudflare tunnel (no port forwarding needed)...")
+        tunnel_proc, public = start_tunnel(port)
+        if public:
+            links.insert(0, ("Internet (public link)", public + link_path))
+        else:
+            print("    ↳ Tunnel didn't start. LAN/Tailscale links still work.")
+
+    print()
+    print("=" * 64)
+    print("  ⚡ SHARING - send the receiver one of these links:")
+    print("=" * 64)
+    for label, link in links:
+        print(f"  {label}:\n    {link}")
+    print(f"\n  SHA256: {digest}")
+    print("\n  Receiver runs:")
+    print(f'    python shardrip.py "{links[0][1]}" --sha256 {digest}')
+    print("  (or opens the link in a browser - slower, single connection)")
+    print("=" * 64)
+    print("  Anyone with the link can download the file while this window is open.")
+    print()
+
+    try:
+        while True:
+            time.sleep(1)
+            sys.stdout.write(stats.line())
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        if tunnel_proc:
+            tunnel_proc.terminate()
+        server.shutdown()
+    print("Sharing stopped.")
+
+
+# ----------------------------------------------------------------------------
+# Interactive prompts
+# ----------------------------------------------------------------------------
+
 def ask(prompt, default=None, cast=str, valid=None):
     """Prompt with an optional default; re-ask until the answer is valid."""
     hint = f" [{default}]" if default not in (None, "") else ""
@@ -181,11 +474,48 @@ def pick_folder(default):
         return default
 
 
+def pick_file():
+    """Open a file picker; returns '' if unavailable/cancelled."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askopenfilename(title="Choose a file to send")
+        root.destroy()
+        return path or ""
+    except Exception:
+        return ""
+
+
+def url_filename(url):
+    return urllib.parse.unquote(os.path.basename(url.split("?")[0])) or "download.bin"
+
+
 def interactive():
     """Ask for everything instead of using command-line args."""
     print("=" * 56)
     print("  ⚡ SHARDRIP - multi-connection downloader")
     print("=" * 56)
+    print("  1) Download a file")
+    print("  2) Send a file to someone")
+    mode = ask("Choose", "1", str, lambda v: v in ("1", "2"))
+
+    if mode == "2":
+        while True:
+            path = ask("File to send (drag it in, or B = browse)")
+            if path.lower() == "b":
+                path = pick_file()
+                print(f"    ↳ {path or '(cancelled)'}")
+            if path and os.path.isfile(path):
+                break
+            print("    ↳ File not found, try again.")
+        port = ask("Port", 8080, int, lambda n: 1024 <= n <= 65535)
+        public = ask("Public internet link via Cloudflare? (Y/n)", "y", str,
+                     lambda v: v.lower() in ("y", "n", "yes", "no"))
+        print()
+        return argparse.Namespace(serve=path, port=port, no_tunnel=public.lower().startswith("n"))
 
     url = ask("Download URL")
     mirrors = []
@@ -202,8 +532,7 @@ def interactive():
         print(f"    ↳ {folder}")
     os.makedirs(folder, exist_ok=True)
 
-    default_name = os.path.basename(url.split("?")[0]) or "download.bin"
-    name = ask("File name", default_name)
+    name = ask("File name", url_filename(url))
     conns = ask("Connections (1-32)", 16, int, lambda n: 1 <= n <= 32)
     sha = input("  SHA256 to verify (Enter to skip): ").strip() or None
     if sha and (len(sha) != 64 or any(c not in "0123456789abcdefABCDEF" for c in sha)):
@@ -212,7 +541,7 @@ def interactive():
 
     print()
     return argparse.Namespace(urls=[url] + mirrors, output=os.path.join(folder, name),
-                              connections=conns, chunk_mb=16, sha256=sha)
+                              connections=conns, chunk_mb=16, sha256=sha, serve=None)
 
 
 def main():
@@ -222,11 +551,17 @@ def main():
     ap.add_argument("-c", "--connections", type=int, default=16, help="parallel connections (default 16)")
     ap.add_argument("--chunk-mb", type=int, default=16, help="chunk size in MB (default 16)")
     ap.add_argument("--sha256", help="expected SHA256 to verify at the end")
+    ap.add_argument("--serve", metavar="FILE", help="SEND mode: share FILE so someone else can download it")
+    ap.add_argument("--port", type=int, default=8080, help="port for --serve (default 8080)")
+    ap.add_argument("--no-tunnel", action="store_true", help="--serve without the public Cloudflare link (LAN/Tailscale only)")
     a = ap.parse_args()
-    if not a.urls:
+    if not a.urls and not a.serve:
         a = interactive()
 
-    out = a.output or os.path.basename(a.urls[0].split("?")[0]) or "download.bin"
+    if a.serve:
+        return serve(a.serve, a.port, tunnel=not a.no_tunnel)
+
+    out = a.output or url_filename(a.urls[0])
     state_path = out + ".state"
 
     # Probe all mirrors, drop any that disagree on size or lack range support
