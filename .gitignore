@@ -1,6 +1,8 @@
 # Download state / partial files
 *.state
 *.state.tmp
+*.part
+*.shardlock
 
 # Downloaded files (don't commit test downloads)
 *.iso
@@ -21,3 +23,8 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# PyInstaller build output (Shardrip.exe)
+build/
+dist/
+*.spec
