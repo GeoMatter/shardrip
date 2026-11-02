@@ -46,7 +46,7 @@ import urllib.parse
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-VERSION = "2.3"
+VERSION = "2.3.1"
 IS_WIN = platform.system() == "Windows"
 IS_ANDROID = "ANDROID_ROOT" in os.environ or "TERMUX_VERSION" in os.environ or sys.platform == "android"
 NO_WINDOW = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW: no console pop-ups from the GUI
@@ -946,16 +946,19 @@ def start_tunnel(port, ui, timeout=60):
         text=True, bufsize=1, encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
     )
     found = queue.Queue()
+    last_error = []
 
     def drain():
         # Keep reading forever: if the pipe fills up, cloudflared would stall.
         sent = False
         for line in proc.stdout:
             if not sent:
-                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                m = TUNNEL_URL_RE.search(line)
                 if m:
                     found.put(m.group(0))
                     sent = True
+                elif " ERR " in line or "failed" in line.lower():
+                    last_error[:] = [line.strip()]
         if not sent:
             found.put(None)
 
@@ -966,8 +969,27 @@ def start_tunnel(port, ui, timeout=60):
         url = None
     if not url:
         proc.terminate()
+        if last_error:
+            ui.log(f"Cloudflare said: {_tunnel_error_hint(last_error[0])}")
         return None, None
     return proc, url
+
+
+# A real Quick Tunnel address is random words joined by hyphens, e.g.
+# https://silicon-nut-your-talking.trycloudflare.com. cloudflared's *error* messages
+# mention https://api.trycloudflare.com (the service it asks for a tunnel) - never
+# mistake that for the share link.
+TUNNEL_URL_RE = re.compile(r"https://(?!api\.)[a-z0-9]+(?:-[a-z0-9]+)+\.trycloudflare\.com")
+
+
+def _tunnel_error_hint(line):
+    low = line.lower()
+    if "429" in low or "too many" in low:
+        return "too many tunnels requested recently - wait a few minutes and try again."
+    if "no such host" in low or "lookup" in low or "dial tcp" in low or "timeout" in low:
+        return "couldn't reach Cloudflare (internet/DNS problem) - check the connection and try again."
+    msg = re.sub(r"^\S+\s+ERR\s+", "", line)
+    return msg[:200]
 
 
 class ServeStats:
