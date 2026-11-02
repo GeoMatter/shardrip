@@ -35,8 +35,7 @@ It does the same job as paid "download accelerators" and "send large files" serv
 
 | Want | Do |
 |---|---|
-| **⭐ The app (everything, incl. QR scan)** | Double-click **`Shardrip.exe`** (no Python), or `shardrip_gui.pyw` / `shardrip_app.pyw`, or `python shardrip.py --app` |
-| **The classic window** | `python shardrip.py --gui`, or `Shardrip.exe --classic` |
+| **⭐ The app (everything, incl. QR scan)** | Double-click **`Shardrip.exe`** (no Python), or `shardrip_gui.pyw`, or `python shardrip.py --gui` |
 | **In your browser** | `python shardrip.py --web` (opens automatically) |
 | **The terminal menu** | Double-click `shardrip.py`, or run `python shardrip.py` |
 
@@ -261,15 +260,12 @@ Quick test: download with `-c 1`, then `-c 16`, and compare the speeds. **8–16
 
 ## Shardrip.exe (no Python needed)
 
-Every [release](../../releases/latest) includes **`Shardrip.exe`**, built automatically on Windows by GitHub Actions and self-tested before it's published. Download it and double-click: no Python, no setup.
+Every [release](../../releases/latest) includes **`Shardrip.exe`**, built automatically on Windows by GitHub Actions and self-tested before it's published. Download it and double-click: no Python, no setup, **no browser**. It's a normal Windows app.
 
-It opens **the full Shardrip app in its own window**: Download, Send, **📷 Scan QR / 🖼 Upload QR image**, Lock, the file browser, everything. It uses the Edge engine built into Windows, with no tabs and no address bar. **Close the window to quit.** The first time you tap Scan QR, allow camera access.
-
-- No Edge or Chrome on the PC? Shardrip opens in your normal browser instead, with a small "Shardrip is running" window. Click **Quit** there when you're done.
-- Prefer the older plain window? Run `Shardrip.exe --classic`.
-
+- **⬇ Download tab:** paste a link, or **📷 Scan QR** with your webcam, or **🖼 Upload QR image** (a screenshot or photo, e.g. from WhatsApp). The link fills itself in; for locked files, type the password and press Start.
+- **⬆ Send tab:** pick a file and press **Start sharing**. You get the link, a QR code and Copy buttons. Lock it with a password if you want.
 - Windows may say **"Windows protected your PC"**, because the app isn't paid-signed. Click **More info → Run anyway**.
-- Prefer Python, or on Mac/Linux/Android? Use `shardrip.py` from **Source code (zip)** on the same page.
+- Prefer Python, or on Mac/Linux/Android? Use `shardrip.py` from **Source code (zip)**. Double-clicking `shardrip_gui.pyw` opens the same app. QR scanning with Python installs OpenCV automatically the first time (`opencv-python-headless`).
 
 ## License
 

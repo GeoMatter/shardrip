@@ -1,6 +1,6 @@
-# Double-click this file to open the Shardrip app in its own window (same as Shardrip.exe).
+# Double-click this file to open the Shardrip app (same as Shardrip.exe). No browser involved.
 # (.pyw files run with pythonw.exe on Windows - no console window.)
-# Keep it in the same folder as shardrip.py.  Older plain window:  shardrip_gui.pyw --classic
+# Keep it in the same folder as shardrip.py.
 import os
 import sys
 
@@ -18,7 +18,7 @@ if "--selftest" in sys.argv:
         f.write("\n".join(results) + "\n")
     sys.exit(0 if all(r.startswith("PASS") for r in results) else 1)
 
-if "--classic" in sys.argv:
-    shardrip.gui_main()  # the older Tk window
+if "--browser" in sys.argv:
+    shardrip.app_main()  # optional: the app inside a browser window
 else:
-    shardrip.app_main()
+    shardrip.gui_main()  # the native Shardrip app (no browser)

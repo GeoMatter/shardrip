@@ -24,7 +24,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tools
-        run: python -m pip install --upgrade pip pyinstaller requests cryptography
+        run: python -m pip install --upgrade pip pyinstaller requests cryptography opencv-python-headless numpy
 
       - name: Build Shardrip.exe
         run: >
@@ -32,6 +32,8 @@ jobs:
           --hidden-import requests
           --hidden-import cryptography.hazmat.primitives.ciphers.aead
           --hidden-import cryptography.exceptions
+          --hidden-import cv2
+          --hidden-import numpy
           shardrip_app.pyw
 
       - name: Self-test the finished .exe
