@@ -1,0 +1,59 @@
+# Builds Shardrip.exe on a real Windows machine, checks it works, and makes it downloadable.
+#   - Every push: the .exe appears under the "Actions" tab -> the run -> "Artifacts".
+#   - Publish a release (e.g. tag v2.1): the .exe is built and attached to the release automatically.
+name: Build Shardrip.exe
+
+on:
+  push:
+    branches: ["**"]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip pyinstaller requests cryptography
+
+      - name: Build Shardrip.exe
+        run: >
+          pyinstaller --onefile --windowed --name Shardrip
+          --hidden-import requests
+          --hidden-import cryptography.hazmat.primitives.ciphers.aead
+          --hidden-import cryptography.exceptions
+          shardrip_gui.pyw
+
+      - name: Self-test the finished .exe
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\Shardrip.exe -ArgumentList "--selftest", "selftest.txt" -Wait -PassThru
+          Get-Content selftest.txt
+          if ($p.ExitCode -ne 0) { Write-Error "Self-test failed"; exit 1 }
+          (Get-FileHash dist\Shardrip.exe -Algorithm SHA256).Hash | Tee-Object dist\Shardrip.exe.sha256.txt
+          "{0:N1} MB" -f ((Get-Item dist\Shardrip.exe).Length / 1MB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Shardrip-exe
+          path: |
+            dist/Shardrip.exe
+            dist/Shardrip.exe.sha256.txt
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Shardrip.exe
+            dist/Shardrip.exe.sha256.txt

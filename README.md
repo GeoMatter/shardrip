@@ -25,6 +25,7 @@ It does the same job as paid "download accelerators" and "send large files" serv
 | **Lock** | Password encryption (AES-256-GCM). Only someone with the password can read the file |
 | **GUI** | Download and Send tabs, progress bar, Copy buttons, QR code |
 | **Web interface** | The same app in any browser, phone-friendly. Runs on Android via Termux |
+| **QR scanner** | In the web interface: scan the sender's QR with your camera, and the link fills itself in |
 | **Safe by default** | Never overwrites a finished file without asking. Detects if a file changed on the server before resuming |
 | **One file** | Needs `requests` (and `cryptography` for Lock). Both install themselves on first use |
 
@@ -40,7 +41,7 @@ It does the same job as paid "download accelerators" and "send large files" serv
 
 ```
 ========================================================
-  ⚡ SHARDRIP 2.0 - multi-connection downloader
+  ⚡ SHARDRIP 2.2 - multi-connection downloader
 ========================================================
   1) Download a file
   2) Send a file to someone
@@ -90,7 +91,7 @@ Shardrip starts a small **private** web page on your own device and opens it in 
 
 ```
 ================================================================
-  ⚡ SHARDRIP 2.1 - web interface is running
+  ⚡ SHARDRIP 2.2 - web interface is running
 ================================================================
   Open this in your browser:
     http://127.0.0.1:7777/?key=fvcRFY7HeHlMmSV4_6J-xg
@@ -103,6 +104,14 @@ Shardrip starts a small **private** web page on your own device and opens it in 
 | `--web-port` | Port for the page | 7777 |
 | `--lan` | Also allow **other devices on your Wi-Fi** (e.g. control your PC from your phone). Prints a QR to scan | off (this device only) |
 | `--no-browser` | Don't open the browser automatically | off |
+
+### 📷 Scan a QR code instead of typing the link
+
+On the **⬇ Download** tab, tap **📷 Scan** and point your camera at the QR code on the sender's screen. The link and file name fill in by themselves. If the file is **locked**, Shardrip jumps to the password box: type the password the sender gave you (it's never inside the QR) and press **Start download**.
+
+- **Live camera** works when the page runs on the same device, like Shardrip on your phone in Termux, or on your PC with a webcam.
+- With `--lan` (your phone controlling your PC), browsers block the camera on plain `http` pages. Tap **🖼 Use a photo** instead and take a picture of the QR.
+- Scanning uses the browser's built-in QR reader where there is one, and the embedded [jsQR](https://github.com/cozmo/jsQR) library otherwise. See `THIRD-PARTY-NOTICES.md`.
 
 **Security:**
 - **By default only your own device can open it.** It listens on `127.0.0.1`, so nothing on your network can reach it.
@@ -249,6 +258,13 @@ Quick test: download with `-c 1`, then `-c 16`, and compare the speeds. **8–16
 - Every mirror must serve the **exact same file**. Mirrors with a different size are skipped automatically.
 - Please be considerate: don't hammer small or free servers with a large number of connections.
 
+## Shardrip.exe (no Python needed)
+
+Every [release](../../releases/latest) includes **`Shardrip.exe`**, built automatically on Windows by GitHub Actions and self-tested before it's published. Download it and double-click: no Python, no setup.
+
+- Windows may say **"Windows protected your PC"**, because the app isn't paid-signed. Click **More info → Run anyway**.
+- Prefer Python, or on Mac/Linux/Android? Use `shardrip.py` from **Source code (zip)** on the same page.
+
 ## License
 
-[MIT](LICENSE): free to use, modify and share.
+[MIT](LICENSE): free to use, modify and share. Includes jsQR (Apache-2.0); see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
