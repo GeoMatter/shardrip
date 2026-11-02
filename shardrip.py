@@ -22,6 +22,7 @@ Usage:
   Send:         python shardrip.py --serve "C:\\path\\file.iso" [--lock] [--no-tunnel]
   Window:       python shardrip.py --gui
   Browser:      python shardrip.py --web            (any browser, incl. phones via Termux)
+  App window:   python shardrip.py --app            (the full app in its own window - what Shardrip.exe opens)
 """
 import argparse
 import getpass
@@ -45,7 +46,7 @@ import urllib.parse
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-VERSION = "2.2"
+VERSION = "2.3"
 IS_WIN = platform.system() == "Windows"
 IS_ANDROID = "ANDROID_ROOT" in os.environ or "TERMUX_VERSION" in os.environ or sys.platform == "android"
 NO_WINDOW = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW: no console pop-ups from the GUI
@@ -1208,6 +1209,13 @@ def self_test():
 
     check("lock encrypt/decrypt (cryptography)", lock_roundtrip)
 
+    def app_engine():
+        b = find_app_browser()
+        if IS_WIN and not b:
+            raise RuntimeError("no Edge/Chrome found - Shardrip will use the default browser instead")
+
+    check("app window engine (Edge/Chrome)", app_engine)
+
     def tk_window():
         import tkinter
         r = tkinter.Tk()
@@ -1373,12 +1381,14 @@ def interactive():
     print("=" * 56)
     print("  1) Download a file")
     print("  2) Send a file to someone")
-    print("  3) Open the window (GUI)" + ("  [not available on Android]" if IS_ANDROID else ""))
+    print("  3) Open the app (window)" + ("  [not available on Android - use 4]" if IS_ANDROID else ""))
     print("  4) Open in your web browser (works on phones too)")
     mode = ask("Choose", "1", str, lambda v: v in ("1", "2", "3", "4"))
 
     if mode == "3":
-        return argparse.Namespace(gui=True, web=False)
+        if IS_ANDROID:
+            return argparse.Namespace(gui=False, web=True, lan=False, web_port=7777)
+        app_main()
     if mode == "4":
         return argparse.Namespace(gui=False, web=True, lan=False, web_port=7777)
 
@@ -2217,26 +2227,47 @@ def open_browser(url):
         pass
 
 
-def web_main(port=7777, lan=False, open_it=True):
+def start_web_server(port=7777, lan=False, tries=1):
+    """Start the web interface in the background. Returns (server, state, local_url, lan_url)."""
     key = secrets.token_urlsafe(16)
     allowed = {"localhost", "127.0.0.1", "[::1]"}
     ip = lan_ip()
     if lan:
         allowed.add(ip)
     state = WebState()
-    try:
-        server = QuietServer(("0.0.0.0" if lan else "127.0.0.1", port), make_web_handler(state, key, allowed))
-    except OSError as e:
-        raise OSError(f"Port {port} is in use ({e}). Try --web-port 7778")
+    server, err = None, None
+    for p in range(port, port + max(1, tries)):
+        try:
+            server = QuietServer(("0.0.0.0" if lan else "127.0.0.1", p), make_web_handler(state, key, allowed))
+            port = p
+            break
+        except OSError as e:
+            err = e
+    if server is None:
+        raise OSError(f"Port {port} is in use ({err}). Try --web-port 7778")
     threading.Thread(target=server.serve_forever, daemon=True).start()
-
     local = f"http://127.0.0.1:{port}/?key={key}"
+    return server, state, local, (f"http://{ip}:{port}/?key={key}" if lan else None)
+
+
+def _shutdown_web(server, state):
+    if state.share:
+        try:
+            state.share.stop()
+        except Exception:
+            pass
+    if state.dl_stop:
+        state.dl_stop.set()
+    server.shutdown()
+
+
+def web_main(port=7777, lan=False, open_it=True):
+    server, state, local, lan_link = start_web_server(port, lan)
     print("=" * 64)
     print(f"  ⚡ SHARDRIP {VERSION} - web interface is running")
     print("=" * 64)
     print(f"  Open this in your browser:\n    {local}")
-    if lan:
-        lan_link = f"http://{ip}:{port}/?key={key}"
+    if lan_link:
         print(f"\n  From another device on your Wi-Fi:\n    {lan_link}\n")
         try:
             print(qr_terminal(qr_encode(lan_link)))
@@ -2253,12 +2284,104 @@ def web_main(port=7777, lan=False, open_it=True):
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
-        if state.share:
-            state.share.stop()
-        if state.dl_stop:
-            state.dl_stop.set()
-        server.shutdown()
+        _shutdown_web(server, state)
     os._exit(0)
+
+
+# ============================================================================
+# App mode (--app / Shardrip.exe): the full web interface in its own app window.
+# Uses Edge (built into Windows 10/11) or Chrome in "--app" mode: a plain window
+# with no tabs or address bar. Closing it quits Shardrip. If neither is found,
+# it falls back to your normal browser plus a small "Shardrip is running" window.
+# ============================================================================
+
+def find_app_browser():
+    """Path to a Chromium-based browser that supports --app windows, or None."""
+    override = os.environ.get("SHARDRIP_BROWSER")
+    if override and os.path.isfile(override):
+        return override
+    cands = []
+    if IS_WIN:
+        for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+                     os.environ.get("LOCALAPPDATA")):
+            if base:
+                cands += [os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"),
+                          os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"),
+                          os.path.join(base, "BraveSoftware", "Brave-Browser", "Application", "brave.exe")]
+    elif platform.system() == "Darwin":
+        cands += ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    for name in ("msedge", "microsoft-edge", "google-chrome", "chromium", "chromium-browser", "brave-browser"):
+        w = shutil.which(name)
+        if w:
+            return w
+    return None
+
+
+def _app_profile_dir():
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    d = os.path.join(base, "Shardrip", "app-window")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _running_window(local_url, on_quit):
+    """Fallback when no app-capable browser exists: a small window to reopen or quit."""
+    import tkinter as tk
+    from tkinter import ttk
+    root = tk.Tk()
+    root.title("Shardrip")
+    root.resizable(False, False)
+    f = ttk.Frame(root, padding=18)
+    f.pack()
+    ttk.Label(f, text="⚡ Shardrip is running", font=("Segoe UI", 13, "bold")).pack(anchor="w")
+    ttk.Label(f, text="It opened in your web browser.\nKeep this window open while you use it.",
+              justify="left").pack(anchor="w", pady=(6, 12))
+    row = ttk.Frame(f)
+    row.pack(fill="x")
+    ttk.Button(row, text="Open Shardrip", command=lambda: open_browser(local_url)).pack(side="left")
+    ttk.Button(row, text="Quit", command=lambda: (root.destroy(), on_quit())).pack(side="left", padx=8)
+    root.protocol("WM_DELETE_WINDOW", lambda: (root.destroy(), on_quit()))
+    root.mainloop()
+
+
+def app_main():
+    server, state, local, _ = start_web_server(7777, lan=False, tries=30)
+
+    def quit_all():
+        _shutdown_web(server, state)
+        os._exit(0)
+
+    exe = find_app_browser()
+    if exe:
+        t0 = time.time()
+        try:
+            proc = subprocess.Popen(
+                [exe, f"--app={local}", f"--user-data-dir={_app_profile_dir()}", "--no-first-run",
+                 "--no-default-browser-check", "--window-size=700,1000"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+            proc.wait()  # returns when the Shardrip window is closed
+        except OSError:
+            proc = None
+        if proc is not None and time.time() - t0 > 4:
+            quit_all()
+        # The browser handed off to an already-open instance (or failed): keep running
+        # with a small control window so Shardrip doesn't vanish under the user.
+    else:
+        open_browser(local)
+    try:
+        _running_window(local, quit_all)
+    except Exception:
+        print(f"Shardrip is running at {local}\nPress Ctrl+C to quit.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+    quit_all()
 
 
 # jsQR 1.4.0 (https://github.com/cozmo/jsQR, Apache-2.0, see THIRD-PARTY-NOTICES.md):
@@ -3048,76 +3171,136 @@ WEB_PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Shardrip</title>
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b1220">
 <style>
-:root{--bg:#f4f5f7;--card:#fff;--fg:#16181d;--muted:#667085;--line:#e2e5ea;--accent:#2e9d4f;--accent2:#24813f;
---danger:#c0392b;--input:#fff;--log:#f7f8fa;--shadow:0 1px 3px rgba(0,0,0,.08)}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--fg:#e8eaed;--muted:#9aa3af;--line:#2a2f3a;
---input:#11141a;--log:#0c0e12;--shadow:none}}
-*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--fg);
-font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-header{display:flex;align-items:baseline;gap:10px;padding:16px 16px 6px;max-width:860px;margin:auto}
-header h1{margin:0;font-size:22px}header span{color:var(--muted);font-size:13px}
-main{max-width:860px;margin:auto;padding:0 16px 40px}
-.tabs{display:flex;gap:6px;margin:8px 0 12px}
-.tab{flex:1;padding:11px;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:10px;
-font-weight:600;font-size:15px;cursor:pointer}
-.tab.on{background:var(--accent);border-color:var(--accent);color:#fff}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;box-shadow:var(--shadow)}
-label{display:block;font-size:13px;color:var(--muted);margin:12px 0 4px}
-input[type=text],input[type=password],input[type=number]{width:100%;padding:11px 12px;border:1px solid var(--line);
-border-radius:9px;background:var(--input);color:var(--fg);font-size:15px;min-width:0}
+:root{--bg:#0a0f1a;--top:#0b1220;--card:#0f1828;--line:#1d2a40;--input:#131e31;--input-line:#22314b;
+--fg:#e7eef8;--head:#f3f7fd;--muted:#8ea3bf;--label:#6f86a6;--ph:#51657f;--accent:#00c2f5;--accent2:#33d0fa;
+--accent-ink:#03131f;--danger:#ff6b6b;--amber:#fbbf24;--log:#0a1220;
+--font:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,Roboto,sans-serif}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--fg);
+font:14px/1.5 var(--font)}
+body{background:radial-gradient(1200px 500px at 50% -200px,#10203a 0%,var(--bg) 60%) fixed,var(--bg)}
+::selection{background:#00c2f544}
+::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:#22314b;border-radius:8px;border:2px solid var(--bg)}
+::-webkit-scrollbar-track{background:transparent}
+
+/* top bar */
+.top{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:16px;height:54px;padding:0 18px;
+background:rgba(11,18,32,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px;color:var(--head);letter-spacing:.2px}
+.logo{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;font-size:15px;
+background:linear-gradient(135deg,#00c2f5,#2563eb);box-shadow:0 0 0 1px #ffffff1a inset,0 4px 14px #00c2f533}
+.tabs{display:flex;gap:6px}
+.tab{padding:6px 14px;border-radius:7px;border:1px solid var(--input-line);background:transparent;color:var(--muted);
+font:600 13px/1.2 var(--font);cursor:pointer;transition:.15s}
+.tab:hover{color:var(--fg);border-color:#2f4466}
+.tab.on{color:var(--accent);border-color:var(--accent);background:#00c2f514}
+.ver{margin-left:auto;font:12px ui-monospace,Consolas,monospace;color:var(--label);border:1px solid var(--line);
+border-radius:20px;padding:3px 10px}
+
+/* cards + fields */
+main{max-width:640px;margin:0 auto;padding:28px 16px 48px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:24px;
+box-shadow:0 10px 30px rgba(0,0,0,.25)}
+.card h2{margin:0;font-size:21px;font-weight:700;color:var(--head);letter-spacing:.2px}
+.sub{margin:4px 0 6px;color:var(--muted);font-size:13px}
+label{display:block;margin:16px 0 6px;font:500 11px/1.2 ui-monospace,"Cascadia Mono",Consolas,monospace;
+text-transform:uppercase;letter-spacing:.09em;color:var(--label)}
+input[type=text],input[type=password],input[type=number]{width:100%;min-width:0;padding:11px 13px;border-radius:8px;
+border:1px solid var(--input-line);background:var(--input);color:var(--fg);font:14px var(--font);outline:none;transition:.15s}
+input::placeholder{color:var(--ph)}
+input:focus{border-color:var(--accent);box-shadow:0 0 0 3px #00c2f526}
+input[readonly]{color:#bcd0e8;font:13px ui-monospace,Consolas,monospace}
 .row{display:flex;gap:8px;align-items:center}.row>input{flex:1}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-button{padding:11px 16px;border-radius:9px;border:1px solid var(--line);background:var(--card);color:var(--fg);
-font-size:15px;cursor:pointer;white-space:nowrap}
-button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
-button.primary:hover{background:var(--accent2)}button.stop{color:var(--danger)}
-button:disabled{opacity:.45;cursor:default}
-.actions{display:flex;gap:8px;margin-top:16px}.actions button{flex:1}
-.check{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:15px;color:var(--fg)}
-.check input{width:20px;height:20px;accent-color:var(--accent)}
-.bar{height:14px;background:var(--line);border-radius:7px;overflow:hidden;margin-top:16px}
-.bar>div{height:100%;width:0;background:var(--accent);transition:width .4s}
-.status{margin-top:8px;font-size:14px;color:var(--muted);word-break:break-word}
-pre.log{background:var(--log);border:1px solid var(--line);border-radius:9px;padding:10px;margin:14px 0 0;
-max-height:220px;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
-.links{margin-top:14px;display:grid;gap:10px}
-.lnk .t{font-size:13px;color:var(--muted);margin-bottom:4px}.lnk .t b{color:var(--fg)}
-.share{display:grid;grid-template-columns:1fr 210px;gap:16px;align-items:start}
-.qr{background:#fff;border-radius:10px;padding:6px;border:1px solid var(--line)}.qr svg{display:block;width:100%}
-.qrcap{text-align:center;font-size:12px;color:var(--muted);margin-top:4px}
-.pw{font:600 16px ui-monospace,Consolas,monospace}
-.hint{font-size:13px;color:var(--muted);margin-top:6px}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:flex-end;justify-content:center;z-index:9}
-.modal.on{display:flex}.sheet{background:var(--card);width:100%;max-width:560px;border-radius:16px 16px 0 0;
-padding:16px;max-height:85vh;display:flex;flex-direction:column}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
+button{padding:11px 16px;border-radius:8px;border:1px solid var(--input-line);background:transparent;color:var(--muted);
+font:600 14px var(--font);cursor:pointer;white-space:nowrap;transition:.15s}
+button:hover:not(:disabled){color:var(--accent);border-color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:700}
+button.primary:hover:not(:disabled){background:var(--accent2);border-color:var(--accent2);color:var(--accent-ink);
+box-shadow:0 6px 20px #00c2f540}
+button.stop:not(:disabled){color:var(--danger);border-color:#ff6b6b55}
+button.stop:hover:not(:disabled){color:#fff;background:#ff6b6b22;border-color:var(--danger)}
+button:disabled{opacity:.4;cursor:default}
+.actions{display:flex;flex-direction:column;gap:8px;margin-top:20px}
+.check{display:flex;align-items:center;gap:10px;margin:16px 0 0;font:500 14px var(--font);text-transform:none;
+letter-spacing:0;color:var(--fg);cursor:pointer}
+.check input{width:18px;height:18px;accent-color:var(--accent);margin:0}
+.grid2 .check{margin-top:38px}
+.note{margin-top:12px;padding:10px 12px;border-radius:8px;border:1px solid #f59e0b66;background:#f59e0b12;
+color:var(--amber);font-size:13px}
+.bar{height:10px;background:var(--input);border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-top:20px}
+.bar>div{height:100%;width:0;background:linear-gradient(90deg,#00c2f5,#2563eb);transition:width .4s}
+.status{margin-top:10px;font-size:13px;color:var(--muted);word-break:break-word}
+pre.log{background:var(--log);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:14px 0 0;
+max-height:200px;overflow:auto;color:#9fb2cc;font:12px/1.55 ui-monospace,"Cascadia Mono",Consolas,monospace;
+white-space:pre-wrap;word-break:break-all}
+pre.log:empty{display:none}
+
+/* sharing */
+.links{display:grid;gap:4px}
+.lnk .t{margin:12px 0 6px;font:500 11px/1.2 ui-monospace,Consolas,monospace;text-transform:uppercase;letter-spacing:.09em;color:var(--label)}
+.lnk .t b{color:var(--accent);font-weight:600}
+.share{display:grid;grid-template-columns:1fr 200px;gap:18px;align-items:start;margin-top:6px}
+.qr{background:#fff;border-radius:12px;padding:8px;margin-top:12px;box-shadow:0 0 0 1px var(--line),0 8px 24px rgba(0,0,0,.35)}
+.qr svg{display:block;width:100%}
+.qrcap{text-align:center;font-size:12px;color:var(--muted);margin-top:8px}
+.pw{color:var(--amber)!important;font:600 15px ui-monospace,Consolas,monospace!important}
+.hint{font-size:13px;color:var(--muted);margin-top:10px}
+
+/* sheets (pickers, questions, scanner) */
+.modal{position:fixed;inset:0;background:rgba(3,7,15,.7);backdrop-filter:blur(3px);display:none;align-items:flex-end;
+justify-content:center;z-index:9}
+.modal.on{display:flex}
+.sheet{background:var(--card);border:1px solid var(--line);width:100%;max-width:560px;border-radius:16px 16px 0 0;
+padding:20px;max-height:88vh;display:flex;flex-direction:column;box-shadow:0 -10px 40px rgba(0,0,0,.4)}
 @media (min-width:640px){.modal{align-items:center}.sheet{border-radius:16px}}
-.sheet h3{margin:0 0 8px;font-size:17px}.crumb{font-size:12px;color:var(--muted);word-break:break-all;margin-bottom:8px}
-.list{overflow:auto;border:1px solid var(--line);border-radius:9px;flex:1;min-height:160px}
-.item{display:flex;justify-content:space-between;gap:8px;padding:12px;border-bottom:1px solid var(--line);cursor:pointer}
-.item:last-child{border-bottom:0}.item:hover{background:var(--log)}.item small{color:var(--muted);white-space:nowrap}
-.cam{position:relative;background:#000;border-radius:12px;overflow:hidden;aspect-ratio:1/1;max-height:60vh;margin:4px auto 0;width:100%}
+.sheet h3{margin:0 0 10px;font-size:17px;color:var(--head)}
+.sheet p{color:var(--muted)}
+.sheet .actions{flex-direction:row}.sheet .actions button{flex:1}
+.crumb{font:12px ui-monospace,Consolas,monospace;color:var(--label);word-break:break-all;margin-bottom:10px}
+.list{overflow:auto;border:1px solid var(--line);border-radius:10px;flex:1;min-height:160px;background:var(--log)}
+.item{display:flex;justify-content:space-between;gap:8px;padding:11px 13px;border-bottom:1px solid var(--line);cursor:pointer}
+.item:last-child{border-bottom:0}.item:hover{background:var(--input);color:var(--accent)}
+.item small{color:var(--label);white-space:nowrap;font-family:ui-monospace,Consolas,monospace}
+.cam{position:relative;background:#000;border-radius:12px;overflow:hidden;aspect-ratio:1/1;max-height:58vh;margin:4px auto 0;
+width:100%;border:1px solid var(--line)}
 .cam video{width:100%;height:100%;object-fit:cover;display:block}
-.cam .frame{position:absolute;inset:18%;border:3px solid rgba(255,255,255,.9);border-radius:14px;box-shadow:0 0 0 999px rgba(0,0,0,.35)}
-.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#16181d;color:#fff;padding:9px 16px;
-border-radius:20px;font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:10}.toast.on{opacity:1}
-@media (max-width:640px){.share{grid-template-columns:1fr}.qr{max-width:240px;margin:auto}.grid2{grid-template-columns:1fr}
-header{padding-top:12px}}
+.cam .frame{position:absolute;inset:18%;border:3px solid var(--accent);border-radius:16px;box-shadow:0 0 0 999px rgba(0,0,0,.45),0 0 24px #00c2f566}
+.toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:var(--card);color:var(--fg);
+border:1px solid var(--accent);padding:10px 18px;border-radius:10px;font-size:14px;opacity:0;transition:opacity .2s;
+pointer-events:none;z-index:10;box-shadow:0 10px 30px rgba(0,0,0,.4);max-width:90vw;text-align:center}
+.toast.on{opacity:1}
+@media (max-width:540px){
+  .top{padding:0 12px;gap:10px}.brand b{display:none}.ver{display:none}.tabs{margin-left:auto}
+  main{padding:16px 10px 40px}.card{padding:18px 16px}
+  .share{grid-template-columns:1fr}.qr{max-width:240px;margin:12px auto 0}
+  .grid2{grid-template-columns:1fr}.grid2 .check{margin-top:16px}
+}
 </style></head><body>
-<header><h1>⚡ Shardrip</h1><span>v__VERSION__ · downloader &amp; file sender</span></header>
+<header class="top">
+  <div class="brand"><span class="logo">⚡</span><b>Shardrip</b></div>
+  <nav class="tabs"><button class="tab on" data-t="dl">⬇ Download</button><button class="tab" data-t="send">⬆ Send</button></nav>
+  <span class="ver">v__VERSION__</span>
+</header>
 <main>
-<div class="tabs"><button class="tab on" data-t="dl">⬇ Download</button><button class="tab" data-t="send">⬆ Send</button></div>
 
 <section id="dl" class="card">
-  <label>Download URL</label><div class="row"><input type="text" id="url" placeholder="https://… direct file link" autocomplete="off"><button id="scanBtn" title="Scan a Shardrip QR code">📷 Scan</button></div>
-  <label>Save to</label><div class="row"><input type="text" id="folder"><button id="pickFolder">Browse</button></div>
-  <label>File name</label><input type="text" id="name" autocomplete="off">
+  <h2>Download a file</h2>
+  <div class="sub">Paste a link, or scan / upload a Shardrip QR code.</div>
+  <label>Download URL:</label>
+  <div class="row"><input type="text" id="url" placeholder="https://… direct file link" autocomplete="off"><button id="scanBtn" title="Scan or upload a Shardrip QR code">📷 Scan QR</button></div>
+  <label>Save to:</label>
+  <div class="row"><input type="text" id="folder"><button id="pickFolder">Browse</button></div>
   <div class="grid2">
-    <div><label>Connections</label><input type="number" id="conns" min="1" max="32" value="16"></div>
-    <div><label>Password (locked files)</label><input type="password" id="dlpw" autocomplete="off"></div>
+    <div><label>File name:</label><input type="text" id="name" autocomplete="off"></div>
+    <div><label>Connections:</label><input type="number" id="conns" min="1" max="32" value="16"></div>
+    <div><label>Password (locked files):</label><input type="password" id="dlpw" autocomplete="off" placeholder="only if the file is locked"></div>
+    <div><label>SHA256 (optional):</label><input type="text" id="sha" autocomplete="off" placeholder="to verify the file"></div>
   </div>
-  <label>Extra mirrors (optional, separate with spaces)</label><input type="text" id="mirrors" autocomplete="off">
-  <label>SHA256 (optional)</label><input type="text" id="sha" autocomplete="off">
+  <label>Extra mirrors (optional):</label><input type="text" id="mirrors" autocomplete="off" placeholder="more links to the same file, separated by spaces">
   <div class="actions"><button class="primary" id="dlStart">⬇ Start download</button><button class="stop" id="dlStop" disabled>■ Stop</button></div>
   <div class="bar"><div id="dlBar"></div></div>
   <div class="status" id="dlStatus">Ready.</div>
@@ -3125,13 +3308,17 @@ header{padding-top:12px}}
 </section>
 
 <section id="send" class="card" hidden>
-  <label>File to send</label><div class="row"><input type="text" id="path"><button id="pickFile">Browse</button></div>
+  <h2>Send a file</h2>
+  <div class="sub">Share a file from this device with a link - no port forwarding needed.</div>
+  <label>File to send:</label>
+  <div class="row"><input type="text" id="path" placeholder="pick a file…"><button id="pickFile">Browse</button></div>
   <div class="grid2">
-    <div><label>Port</label><input type="number" id="port" value="8080" min="1024" max="65535"></div>
+    <div><label>Port:</label><input type="number" id="port" value="8080" min="1024" max="65535"></div>
     <div><label class="check"><input type="checkbox" id="public" checked> Public internet link</label></div>
   </div>
   <label class="check"><input type="checkbox" id="lock"> 🔒 Lock with password</label>
-  <div class="row" id="pwrow" hidden style="margin-top:8px"><input type="text" id="sendpw" autocomplete="off"><button id="gen">Generate</button></div>
+  <div class="row" id="pwrow" hidden style="margin-top:10px"><input type="text" id="sendpw" autocomplete="off"><button id="gen">Generate</button></div>
+  <div class="note" id="lockNote" hidden>🔒 Send the password <b>separately</b> from the link - e.g. text the link, say the password. The receiver needs Shardrip to unlock it.</div>
   <div class="actions"><button class="primary" id="sendStart">⬆ Start sharing</button><button class="stop" id="sendStop" disabled>■ Stop sharing</button></div>
   <div class="status" id="sendStatus">Pick a file and press Start sharing.</div>
   <div class="share" id="shareBox" hidden><div class="links" id="links"></div>
@@ -3146,11 +3333,11 @@ header{padding-top:12px}}
 <div class="modal" id="ask"><div class="sheet"><h3>Shardrip</h3><p id="askText"></p>
   <input type="password" id="askPw" hidden autocomplete="off">
   <div class="actions"><button class="primary" id="askYes">OK</button><button id="askNo">Cancel</button></div></div></div>
-<div class="modal" id="scanner"><div class="sheet"><h3>Scan a Shardrip QR code</h3>
+<div class="modal" id="scanner"><div class="sheet"><h3>Scan or upload a Shardrip QR code</h3>
   <div class="cam" id="scanCam"><video id="scanVideo" playsinline muted></video><div class="frame"></div></div>
-  <div class="hint" id="scanHint">Point the camera at the QR code on the sender's screen.</div>
+  <div class="hint" id="scanHint">Point the camera at the QR code, or tap “Upload QR image” to use a screenshot or photo of it.</div>
   <input type="file" id="scanFile" accept="image/*" hidden>
-  <div class="actions"><button id="scanPhoto">🖼 Use a photo</button><button id="scanClose">Cancel</button></div></div></div>
+  <div class="actions"><button id="scanPhoto">🖼 Upload QR image</button><button id="scanClose">Cancel</button></div></div></div>
 <div class="toast" id="toast"></div>
 <script>/*__JSQR__*/</script>
 
@@ -3192,7 +3379,7 @@ $("dlStart").onclick = async () => {
 $("dlStop").onclick = () => api("/api/download/stop", {}).catch(e => toast(e.message));
 
 // ---- send ----
-$("lock").onchange = () => { $("pwrow").hidden = !$("lock").checked; if ($("lock").checked && !$("sendpw").value) gen(); };
+$("lock").onchange = () => { $("pwrow").hidden = $("lockNote").hidden = !$("lock").checked; if ($("lock").checked && !$("sendpw").value) gen(); };
 function gen(){ const a = "abcdefghjkmnpqrstuvwxyz23456789", r = new Uint32Array(16); crypto.getRandomValues(r);
   $("sendpw").value = [0,1,2,3].map(g => [0,1,2,3].map(i => a[r[g*4+i] % a.length]).join("")).join("-"); }
 $("gen").onclick = gen;
@@ -3302,13 +3489,13 @@ async function openScanner(){
   $("scanner").classList.add("on"); $("scanCam").hidden = false; $("scanHint").textContent = "Starting camera…";
   if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.isSecureContext)) {
     $("scanCam").hidden = true;
-    $("scanHint").textContent = "Live camera only works when this page runs on the same device (Shardrip on your phone). Tap “Use a photo” and take a picture of the QR instead.";
+    $("scanHint").textContent = "Live camera isn't available here. Tap “Upload QR image” and pick a screenshot or photo of the QR.";
     return;
   }
   try {
     scanStream = await navigator.mediaDevices.getUserMedia({video: {facingMode: {ideal: "environment"}}, audio: false});
     const v = $("scanVideo"); v.srcObject = scanStream; await v.play();
-    $("scanHint").textContent = "Point the camera at the QR code on the sender's screen.";
+    $("scanHint").textContent = "Point the camera at the QR code, or tap “Upload QR image” to use a screenshot.";
     scanTimer = setInterval(async () => {
       if (scanBusy || v.readyState < 2 || !v.videoWidth) return;
       scanBusy = true;
@@ -3316,7 +3503,7 @@ async function openScanner(){
     }, 250);
   } catch (e) {
     $("scanCam").hidden = true;
-    $("scanHint").textContent = "Couldn't open the camera (" + (e.name || e) + "). Tap “Use a photo” instead.";
+    $("scanHint").textContent = (e && e.name === "NotFoundError" ? "No camera found." : "Couldn't open the camera (" + (e.name || e) + ").") + " Tap “Upload QR image” and pick a screenshot or photo of the QR.";
   }
 }
 $("scanBtn").onclick = openScanner;
@@ -3325,7 +3512,7 @@ $("scanPhoto").onclick = () => $("scanFile").click();
 $("scanFile").onchange = async () => {
   const f = $("scanFile").files[0]; $("scanFile").value = ""; if (!f) return;
   try { const bmp = await createImageBitmap(f); const t = await decodeFrom(bmp, bmp.width, bmp.height);
-        if (t) useScanned(t); else toast("No QR code found in that photo - try again, closer and sharper"); }
+        if (t) useScanned(t); else toast("No QR code found in that image - try a clearer screenshot or photo"); }
   catch (e) { toast("Couldn't read that image"); }
 };
 
@@ -3354,6 +3541,7 @@ def main():
     ap.add_argument("--no-qr", action="store_true", help="--serve without printing the QR code")
     ap.add_argument("--gui", action="store_true", help="open the window version")
     ap.add_argument("--web", action="store_true", help="open the web interface in your browser (works on phones)")
+    ap.add_argument("--app", action="store_true", help="open the full app in its own window (like Shardrip.exe)")
     ap.add_argument("--lan", action="store_true", help="--web: also allow other devices on your Wi-Fi to use it")
     ap.add_argument("--web-port", type=int, default=7777, help="port for --web (default 7777)")
     ap.add_argument("--no-browser", action="store_true", help="--web: don't open the browser automatically")
@@ -3364,6 +3552,9 @@ def main():
         print("\n".join(res))
         return all(r.startswith("PASS") for r in res)
 
+    if a.app:
+        app_main()
+        return True
     if not a.urls and not a.serve and not a.gui and not a.web:
         a = interactive()
     if getattr(a, "web", False):

@@ -32,7 +32,7 @@ jobs:
           --hidden-import requests
           --hidden-import cryptography.hazmat.primitives.ciphers.aead
           --hidden-import cryptography.exceptions
-          shardrip_gui.pyw
+          shardrip_app.pyw
 
       - name: Self-test the finished .exe
         shell: pwsh

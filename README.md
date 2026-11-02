@@ -35,13 +35,14 @@ It does the same job as paid "download accelerators" and "send large files" serv
 
 | Want | Do |
 |---|---|
-| **The window (GUI)** | Double-click `shardrip_gui.pyw`, or run `python shardrip.py --gui` |
+| **⭐ The app (everything, incl. QR scan)** | Double-click **`Shardrip.exe`** (no Python), or `shardrip_gui.pyw` / `shardrip_app.pyw`, or `python shardrip.py --app` |
+| **The classic window** | `python shardrip.py --gui`, or `Shardrip.exe --classic` |
 | **In your browser** | `python shardrip.py --web` (opens automatically) |
 | **The terminal menu** | Double-click `shardrip.py`, or run `python shardrip.py` |
 
 ```
 ========================================================
-  ⚡ SHARDRIP 2.2 - multi-connection downloader
+  ⚡ SHARDRIP 2.3 - multi-connection downloader
 ========================================================
   1) Download a file
   2) Send a file to someone
@@ -91,7 +92,7 @@ Shardrip starts a small **private** web page on your own device and opens it in 
 
 ```
 ================================================================
-  ⚡ SHARDRIP 2.2 - web interface is running
+  ⚡ SHARDRIP 2.3 - web interface is running
 ================================================================
   Open this in your browser:
     http://127.0.0.1:7777/?key=fvcRFY7HeHlMmSV4_6J-xg
@@ -107,10 +108,10 @@ Shardrip starts a small **private** web page on your own device and opens it in 
 
 ### 📷 Scan a QR code instead of typing the link
 
-On the **⬇ Download** tab, tap **📷 Scan** and point your camera at the QR code on the sender's screen. The link and file name fill in by themselves. If the file is **locked**, Shardrip jumps to the password box: type the password the sender gave you (it's never inside the QR) and press **Start download**.
+On the **⬇ Download** tab, tap **📷 Scan QR** and point your camera at the QR code on the sender's screen, **or tap 🖼 Upload QR image** and pick a screenshot or photo of it (e.g. one sent to you on WhatsApp). The link and file name fill in by themselves. If the file is **locked**, Shardrip jumps to the password box: type the password the sender gave you (it's never inside the QR) and press **Start download**.
 
 - **Live camera** works when the page runs on the same device, like Shardrip on your phone in Termux, or on your PC with a webcam.
-- With `--lan` (your phone controlling your PC), browsers block the camera on plain `http` pages. Tap **🖼 Use a photo** instead and take a picture of the QR.
+- No webcam, or using `--lan` (where browsers block the camera on plain `http` pages)? **🖼 Upload QR image** always works.
 - Scanning uses the browser's built-in QR reader where there is one, and the embedded [jsQR](https://github.com/cozmo/jsQR) library otherwise. See `THIRD-PARTY-NOTICES.md`.
 
 **Security:**
@@ -261,6 +262,11 @@ Quick test: download with `-c 1`, then `-c 16`, and compare the speeds. **8–16
 ## Shardrip.exe (no Python needed)
 
 Every [release](../../releases/latest) includes **`Shardrip.exe`**, built automatically on Windows by GitHub Actions and self-tested before it's published. Download it and double-click: no Python, no setup.
+
+It opens **the full Shardrip app in its own window**: Download, Send, **📷 Scan QR / 🖼 Upload QR image**, Lock, the file browser, everything. It uses the Edge engine built into Windows, with no tabs and no address bar. **Close the window to quit.** The first time you tap Scan QR, allow camera access.
+
+- No Edge or Chrome on the PC? Shardrip opens in your normal browser instead, with a small "Shardrip is running" window. Click **Quit** there when you're done.
+- Prefer the older plain window? Run `Shardrip.exe --classic`.
 
 - Windows may say **"Windows protected your PC"**, because the app isn't paid-signed. Click **More info → Run anyway**.
 - Prefer Python, or on Mac/Linux/Android? Use `shardrip.py` from **Source code (zip)** on the same page.
