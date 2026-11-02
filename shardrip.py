@@ -22,6 +22,7 @@ Usage:
   Send:         python shardrip.py --serve "C:\\path\\file.iso" [--lock] [--no-tunnel]
   Window:       python shardrip.py --gui
   Browser:      python shardrip.py --web            (any browser, incl. phones via Termux)
+  App window:   python shardrip.py --app            (the full app in its own window - what Shardrip.exe opens)
 """
 import argparse
 import getpass
@@ -45,7 +46,7 @@ import urllib.parse
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-VERSION = "2.2"
+VERSION = "2.3"
 IS_WIN = platform.system() == "Windows"
 IS_ANDROID = "ANDROID_ROOT" in os.environ or "TERMUX_VERSION" in os.environ or sys.platform == "android"
 NO_WINDOW = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW: no console pop-ups from the GUI
@@ -1208,6 +1209,13 @@ def self_test():
 
     check("lock encrypt/decrypt (cryptography)", lock_roundtrip)
 
+    def app_engine():
+        b = find_app_browser()
+        if IS_WIN and not b:
+            raise RuntimeError("no Edge/Chrome found - Shardrip will use the default browser instead")
+
+    check("app window engine (Edge/Chrome)", app_engine)
+
     def tk_window():
         import tkinter
         r = tkinter.Tk()
@@ -2217,26 +2225,47 @@ def open_browser(url):
         pass
 
 
-def web_main(port=7777, lan=False, open_it=True):
+def start_web_server(port=7777, lan=False, tries=1):
+    """Start the web interface in the background. Returns (server, state, local_url, lan_url)."""
     key = secrets.token_urlsafe(16)
     allowed = {"localhost", "127.0.0.1", "[::1]"}
     ip = lan_ip()
     if lan:
         allowed.add(ip)
     state = WebState()
-    try:
-        server = QuietServer(("0.0.0.0" if lan else "127.0.0.1", port), make_web_handler(state, key, allowed))
-    except OSError as e:
-        raise OSError(f"Port {port} is in use ({e}). Try --web-port 7778")
+    server, err = None, None
+    for p in range(port, port + max(1, tries)):
+        try:
+            server = QuietServer(("0.0.0.0" if lan else "127.0.0.1", p), make_web_handler(state, key, allowed))
+            port = p
+            break
+        except OSError as e:
+            err = e
+    if server is None:
+        raise OSError(f"Port {port} is in use ({err}). Try --web-port 7778")
     threading.Thread(target=server.serve_forever, daemon=True).start()
-
     local = f"http://127.0.0.1:{port}/?key={key}"
+    return server, state, local, (f"http://{ip}:{port}/?key={key}" if lan else None)
+
+
+def _shutdown_web(server, state):
+    if state.share:
+        try:
+            state.share.stop()
+        except Exception:
+            pass
+    if state.dl_stop:
+        state.dl_stop.set()
+    server.shutdown()
+
+
+def web_main(port=7777, lan=False, open_it=True):
+    server, state, local, lan_link = start_web_server(port, lan)
     print("=" * 64)
     print(f"  ⚡ SHARDRIP {VERSION} - web interface is running")
     print("=" * 64)
     print(f"  Open this in your browser:\n    {local}")
-    if lan:
-        lan_link = f"http://{ip}:{port}/?key={key}"
+    if lan_link:
         print(f"\n  From another device on your Wi-Fi:\n    {lan_link}\n")
         try:
             print(qr_terminal(qr_encode(lan_link)))
@@ -2253,12 +2282,104 @@ def web_main(port=7777, lan=False, open_it=True):
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
-        if state.share:
-            state.share.stop()
-        if state.dl_stop:
-            state.dl_stop.set()
-        server.shutdown()
+        _shutdown_web(server, state)
     os._exit(0)
+
+
+# ============================================================================
+# App mode (--app / Shardrip.exe): the full web interface in its own app window.
+# Uses Edge (built into Windows 10/11) or Chrome in "--app" mode: a plain window
+# with no tabs or address bar. Closing it quits Shardrip. If neither is found,
+# it falls back to your normal browser plus a small "Shardrip is running" window.
+# ============================================================================
+
+def find_app_browser():
+    """Path to a Chromium-based browser that supports --app windows, or None."""
+    override = os.environ.get("SHARDRIP_BROWSER")
+    if override and os.path.isfile(override):
+        return override
+    cands = []
+    if IS_WIN:
+        for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+                     os.environ.get("LOCALAPPDATA")):
+            if base:
+                cands += [os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"),
+                          os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"),
+                          os.path.join(base, "BraveSoftware", "Brave-Browser", "Application", "brave.exe")]
+    elif platform.system() == "Darwin":
+        cands += ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    for name in ("msedge", "microsoft-edge", "google-chrome", "chromium", "chromium-browser", "brave-browser"):
+        w = shutil.which(name)
+        if w:
+            return w
+    return None
+
+
+def _app_profile_dir():
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    d = os.path.join(base, "Shardrip", "app-window")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _running_window(local_url, on_quit):
+    """Fallback when no app-capable browser exists: a small window to reopen or quit."""
+    import tkinter as tk
+    from tkinter import ttk
+    root = tk.Tk()
+    root.title("Shardrip")
+    root.resizable(False, False)
+    f = ttk.Frame(root, padding=18)
+    f.pack()
+    ttk.Label(f, text="⚡ Shardrip is running", font=("Segoe UI", 13, "bold")).pack(anchor="w")
+    ttk.Label(f, text="It opened in your web browser.\nKeep this window open while you use it.",
+              justify="left").pack(anchor="w", pady=(6, 12))
+    row = ttk.Frame(f)
+    row.pack(fill="x")
+    ttk.Button(row, text="Open Shardrip", command=lambda: open_browser(local_url)).pack(side="left")
+    ttk.Button(row, text="Quit", command=lambda: (root.destroy(), on_quit())).pack(side="left", padx=8)
+    root.protocol("WM_DELETE_WINDOW", lambda: (root.destroy(), on_quit()))
+    root.mainloop()
+
+
+def app_main():
+    server, state, local, _ = start_web_server(7777, lan=False, tries=30)
+
+    def quit_all():
+        _shutdown_web(server, state)
+        os._exit(0)
+
+    exe = find_app_browser()
+    if exe:
+        t0 = time.time()
+        try:
+            proc = subprocess.Popen(
+                [exe, f"--app={local}", f"--user-data-dir={_app_profile_dir()}", "--no-first-run",
+                 "--no-default-browser-check", "--window-size=560,960"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+            proc.wait()  # returns when the Shardrip window is closed
+        except OSError:
+            proc = None
+        if proc is not None and time.time() - t0 > 4:
+            quit_all()
+        # The browser handed off to an already-open instance (or failed): keep running
+        # with a small control window so Shardrip doesn't vanish under the user.
+    else:
+        open_browser(local)
+    try:
+        _running_window(local, quit_all)
+    except Exception:
+        print(f"Shardrip is running at {local}\nPress Ctrl+C to quit.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+    quit_all()
 
 
 # jsQR 1.4.0 (https://github.com/cozmo/jsQR, Apache-2.0, see THIRD-PARTY-NOTICES.md):
@@ -3109,7 +3230,7 @@ header{padding-top:12px}}
 <div class="tabs"><button class="tab on" data-t="dl">⬇ Download</button><button class="tab" data-t="send">⬆ Send</button></div>
 
 <section id="dl" class="card">
-  <label>Download URL</label><div class="row"><input type="text" id="url" placeholder="https://… direct file link" autocomplete="off"><button id="scanBtn" title="Scan a Shardrip QR code">📷 Scan</button></div>
+  <label>Download URL</label><div class="row"><input type="text" id="url" placeholder="https://… direct file link" autocomplete="off"><button id="scanBtn" title="Scan or upload a Shardrip QR code">📷 Scan QR</button></div>
   <label>Save to</label><div class="row"><input type="text" id="folder"><button id="pickFolder">Browse</button></div>
   <label>File name</label><input type="text" id="name" autocomplete="off">
   <div class="grid2">
@@ -3146,11 +3267,11 @@ header{padding-top:12px}}
 <div class="modal" id="ask"><div class="sheet"><h3>Shardrip</h3><p id="askText"></p>
   <input type="password" id="askPw" hidden autocomplete="off">
   <div class="actions"><button class="primary" id="askYes">OK</button><button id="askNo">Cancel</button></div></div></div>
-<div class="modal" id="scanner"><div class="sheet"><h3>Scan a Shardrip QR code</h3>
+<div class="modal" id="scanner"><div class="sheet"><h3>Scan or upload a Shardrip QR code</h3>
   <div class="cam" id="scanCam"><video id="scanVideo" playsinline muted></video><div class="frame"></div></div>
-  <div class="hint" id="scanHint">Point the camera at the QR code on the sender's screen.</div>
+  <div class="hint" id="scanHint">Point the camera at the QR code, or tap “Upload QR image” to use a screenshot or photo of it.</div>
   <input type="file" id="scanFile" accept="image/*" hidden>
-  <div class="actions"><button id="scanPhoto">🖼 Use a photo</button><button id="scanClose">Cancel</button></div></div></div>
+  <div class="actions"><button id="scanPhoto">🖼 Upload QR image</button><button id="scanClose">Cancel</button></div></div></div>
 <div class="toast" id="toast"></div>
 <script>/*__JSQR__*/</script>
 
@@ -3302,13 +3423,13 @@ async function openScanner(){
   $("scanner").classList.add("on"); $("scanCam").hidden = false; $("scanHint").textContent = "Starting camera…";
   if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.isSecureContext)) {
     $("scanCam").hidden = true;
-    $("scanHint").textContent = "Live camera only works when this page runs on the same device (Shardrip on your phone). Tap “Use a photo” and take a picture of the QR instead.";
+    $("scanHint").textContent = "Live camera isn't available here. Tap “Upload QR image” and pick a screenshot or photo of the QR.";
     return;
   }
   try {
     scanStream = await navigator.mediaDevices.getUserMedia({video: {facingMode: {ideal: "environment"}}, audio: false});
     const v = $("scanVideo"); v.srcObject = scanStream; await v.play();
-    $("scanHint").textContent = "Point the camera at the QR code on the sender's screen.";
+    $("scanHint").textContent = "Point the camera at the QR code, or tap “Upload QR image” to use a screenshot.";
     scanTimer = setInterval(async () => {
       if (scanBusy || v.readyState < 2 || !v.videoWidth) return;
       scanBusy = true;
@@ -3316,7 +3437,7 @@ async function openScanner(){
     }, 250);
   } catch (e) {
     $("scanCam").hidden = true;
-    $("scanHint").textContent = "Couldn't open the camera (" + (e.name || e) + "). Tap “Use a photo” instead.";
+    $("scanHint").textContent = (e && e.name === "NotFoundError" ? "No camera found." : "Couldn't open the camera (" + (e.name || e) + ").") + " Tap “Upload QR image” and pick a screenshot or photo of the QR.";
   }
 }
 $("scanBtn").onclick = openScanner;
@@ -3325,7 +3446,7 @@ $("scanPhoto").onclick = () => $("scanFile").click();
 $("scanFile").onchange = async () => {
   const f = $("scanFile").files[0]; $("scanFile").value = ""; if (!f) return;
   try { const bmp = await createImageBitmap(f); const t = await decodeFrom(bmp, bmp.width, bmp.height);
-        if (t) useScanned(t); else toast("No QR code found in that photo - try again, closer and sharper"); }
+        if (t) useScanned(t); else toast("No QR code found in that image - try a clearer screenshot or photo"); }
   catch (e) { toast("Couldn't read that image"); }
 };
 
@@ -3354,6 +3475,7 @@ def main():
     ap.add_argument("--no-qr", action="store_true", help="--serve without printing the QR code")
     ap.add_argument("--gui", action="store_true", help="open the window version")
     ap.add_argument("--web", action="store_true", help="open the web interface in your browser (works on phones)")
+    ap.add_argument("--app", action="store_true", help="open the full app in its own window (like Shardrip.exe)")
     ap.add_argument("--lan", action="store_true", help="--web: also allow other devices on your Wi-Fi to use it")
     ap.add_argument("--web-port", type=int, default=7777, help="port for --web (default 7777)")
     ap.add_argument("--no-browser", action="store_true", help="--web: don't open the browser automatically")
@@ -3364,6 +3486,9 @@ def main():
         print("\n".join(res))
         return all(r.startswith("PASS") for r in res)
 
+    if a.app:
+        app_main()
+        return True
     if not a.urls and not a.serve and not a.gui and not a.web:
         a = interactive()
     if getattr(a, "web", False):
