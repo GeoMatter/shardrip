@@ -1,1 +1,3 @@
 requests>=2.25
+# Only needed for Lock (password encryption). Shardrip installs it automatically on first use.
+cryptography>=41
