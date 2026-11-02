@@ -1150,6 +1150,70 @@ class Share:
 
 
 # ============================================================================
+# Self-test (used to check a packaged Shardrip.exe has everything it needs)
+# ============================================================================
+
+class NullUI:
+    def log(self, msg): pass
+    def status(self, msg): pass
+    def status_end(self): pass
+    def confirm(self, question): return False
+    def ask_password(self): return None
+    def start_progress(self, total, already=0, label=""): return Progress(total, already, label)
+
+
+def self_test():
+    """Check the important parts work. Returns a list of 'PASS ...' / 'FAIL ...' lines."""
+    import tempfile
+    results = []
+
+    def check(name, fn):
+        try:
+            fn()
+            results.append(f"PASS {name}")
+        except Exception as e:
+            results.append(f"FAIL {name}: {e!r}")
+
+    check(f"shardrip {VERSION} loaded", lambda: None)
+    check("https download (requests + certificates)",
+          lambda: requests.get("https://api.github.com", timeout=30, headers=UA).raise_for_status())
+    check("qr code", lambda: qr_terminal(qr_encode("https://example.com/shardrip-selftest")))
+
+    def lock_roundtrip():
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "a.bin")
+            data = os.urandom(3 * 1024 * 1024 + 123)
+            with open(src, "wb") as f:
+                f.write(data)
+            es = EncryptedSource(src, "selftest-pw")
+            enc = os.path.join(d, "a.bin" + LOCK_EXT)
+            with open(enc, "wb") as f:
+                for piece in es.iter_range(0, es.size - 1):
+                    f.write(piece)
+            out = os.path.join(d, "b.bin")
+            decrypt_file(enc, out, "selftest-pw", NullUI())
+            with open(out, "rb") as f:
+                assert f.read() == data, "decrypted data differs"
+            try:
+                decrypt_file(enc, out + "2", "wrong", NullUI())
+                raise AssertionError("wrong password was accepted")
+            except WrongPassword:
+                pass
+
+    check("lock encrypt/decrypt (cryptography)", lock_roundtrip)
+
+    def tk_window():
+        import tkinter
+        r = tkinter.Tk()
+        r.withdraw()
+        r.update()
+        r.destroy()
+
+    check("window toolkit (tkinter)", tk_window)
+    return results
+
+
+# ============================================================================
 # Console (terminal) front-end
 # ============================================================================
 
@@ -2435,7 +2499,12 @@ def main():
     ap.add_argument("--lan", action="store_true", help="--web: also allow other devices on your Wi-Fi to use it")
     ap.add_argument("--web-port", type=int, default=7777, help="port for --web (default 7777)")
     ap.add_argument("--no-browser", action="store_true", help="--web: don't open the browser automatically")
+    ap.add_argument("--selftest", action="store_true", help="check that everything Shardrip needs is working")
     a = ap.parse_args()
+    if a.selftest:
+        res = self_test()
+        print("\n".join(res))
+        return all(r.startswith("PASS") for r in res)
 
     if not a.urls and not a.serve and not a.gui and not a.web:
         a = interactive()
