@@ -35,8 +35,8 @@ It does the same job as paid "download accelerators" and "send large files" serv
 
 | Want | Do |
 |---|---|
-| **⭐ The app (everything, incl. QR scan)** | Double-click **`Shardrip.exe`** (no Python), or `shardrip_app.pyw`, or `python shardrip.py --app` |
-| **The classic window** | Double-click `shardrip_gui.pyw`, or run `python shardrip.py --gui` |
+| **⭐ The app (everything, incl. QR scan)** | Double-click **`Shardrip.exe`** (no Python), or `shardrip_gui.pyw` / `shardrip_app.pyw`, or `python shardrip.py --app` |
+| **The classic window** | `python shardrip.py --gui`, or `Shardrip.exe --classic` |
 | **In your browser** | `python shardrip.py --web` (opens automatically) |
 | **The terminal menu** | Double-click `shardrip.py`, or run `python shardrip.py` |
 
