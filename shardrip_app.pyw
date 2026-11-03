@@ -1,5 +1,5 @@
-# Shardrip as an app: double-click to open the full Shardrip app in its own window
-# (Download, Send, QR scan / upload a QR image, Lock...). No terminal.
+# Shardrip as an app: double-click to open the full Shardrip app - a real native window
+# (Download, Send, QR scan / upload a QR image, Lock...). No terminal, no browser.
 # This is what Shardrip.exe runs. Keep it in the same folder as shardrip.py.
 import os
 import sys
@@ -18,7 +18,7 @@ if "--selftest" in sys.argv:
         f.write("\n".join(results) + "\n")
     sys.exit(0 if all(r.startswith("PASS") for r in results) else 1)
 
-if "--classic" in sys.argv:
-    shardrip.gui_main()  # the older Tk window
+if "--browser" in sys.argv:
+    shardrip.app_main()  # optional: the app inside a browser window
 else:
-    shardrip.app_main()
+    shardrip.gui_main()  # the native Shardrip app (no browser)

@@ -46,7 +46,7 @@ import urllib.parse
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-VERSION = "2.3.1"
+VERSION = "2.4"
 IS_WIN = platform.system() == "Windows"
 IS_ANDROID = "ANDROID_ROOT" in os.environ or "TERMUX_VERSION" in os.environ or sys.platform == "android"
 NO_WINDOW = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW: no console pop-ups from the GUI
@@ -1231,12 +1231,20 @@ def self_test():
 
     check("lock encrypt/decrypt (cryptography)", lock_roundtrip)
 
-    def app_engine():
-        b = find_app_browser()
-        if IS_WIN and not b:
-            raise RuntimeError("no Edge/Chrome found - Shardrip will use the default browser instead")
+    def qr_reader():
+        import numpy as np
+        link = "https://example-test-words.trycloudflare.com/AbC123/file.zip.shardlock"
+        m = qr_encode(link)
+        n, q, px = len(m), 4, 6
+        img = np.full(((n + 2 * q) * px, (n + 2 * q) * px), 255, np.uint8)
+        for y in range(n):
+            for x in range(n):
+                if m[y][x]:
+                    img[(y + q) * px:(y + q + 1) * px, (x + q) * px:(x + q + 1) * px] = 0
+        if qr_from_bgr(img) != link:
+            raise AssertionError("couldn't read back a test QR image")
 
-    check("app window engine (Edge/Chrome)", app_engine)
+    check("qr scan / upload reader (OpenCV)", qr_reader)
 
     def tk_window():
         import tkinter
@@ -1410,7 +1418,7 @@ def interactive():
     if mode == "3":
         if IS_ANDROID:
             return argparse.Namespace(gui=False, web=True, lan=False, web_port=7777)
-        app_main()
+        return argparse.Namespace(gui=True, web=False)
     if mode == "4":
         return argparse.Namespace(gui=False, web=True, lan=False, web_port=7777)
 
@@ -1463,10 +1471,93 @@ def interactive():
 # GUI (tkinter - built into Python)
 # ============================================================================
 
+# ============================================================================
+# QR reading from images / webcam (OpenCV) - used by the native app's Scan QR
+# ============================================================================
+
+def _cv2():
+    """Import OpenCV (installs opencv-python-headless on first use when running from Python)."""
+    return ensure_package("opencv-python-headless", "cv2")
+
+
+def qr_from_bgr(img):
+    """Find and decode a QR code in a BGR/grey image. Returns the text or None."""
+    cv2 = _cv2()
+    import numpy as np
+    if img is None or getattr(img, "size", 0) == 0:
+        return None
+    gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
+    candidates = [gray]
+    if max(h, w) < 900:
+        candidates.append(cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC))
+    if max(h, w) > 2200:
+        s = 1600 / max(h, w)
+        candidates.append(cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA))
+    candidates.append(cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1])
+    candidates.append(255 - gray)  # light-on-dark QR codes
+    detectors = [cv2.QRCodeDetector()]
+    if hasattr(cv2, "QRCodeDetectorAruco"):
+        detectors.append(cv2.QRCodeDetectorAruco())
+    for c in candidates:
+        c = np.ascontiguousarray(c)
+        for d in detectors:
+            try:
+                text, _, _ = d.detectAndDecode(c)
+            except Exception:
+                text = ""
+            if text:
+                return text
+    return None
+
+
+def qr_from_image_file(path):
+    """Decode a QR code from an image file (screenshot/photo). Handles non-English paths."""
+    cv2 = _cv2()
+    import numpy as np
+    data = np.fromfile(path, dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("That file isn't an image Shardrip can read")
+    return qr_from_bgr(img)
+
+
+# ============================================================================
+# Native app (tkinter) - this is what Shardrip.exe opens. No browser involved.
+# ============================================================================
+
+THEME = dict(bg="#0a0f1a", top="#0b1220", card="#0f1828", line="#1d2a40", input="#131e31", input_line="#22314b",
+             fg="#e7eef8", head="#f3f7fd", muted="#8ea3bf", label="#6f86a6", accent="#00c2f5", accent2="#33d0fa",
+             accent_dim="#0b5f78", ink="#03131f", danger="#ff6b6b", amber="#fbbf24", log="#0a1220",
+             hover="#18263c")
+
+
+def _dark_title_bar(win):
+    """Windows 10/11: make the window's title bar dark to match the app."""
+    if not IS_WIN:
+        return
+    try:
+        import ctypes
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        on = ctypes.c_int(1)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (new / old builds)
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(on), ctypes.sizeof(on)) == 0:
+                break
+    except Exception:
+        pass
+
+
 def gui_main(_test_hook=None):
     import tkinter as tk
-    from tkinter import filedialog, messagebox, simpledialog, ttk
-    from tkinter.scrolledtext import ScrolledText
+    from tkinter import filedialog, ttk
+
+    T = THEME
+    UI_FONT = ("Segoe UI", 10)
+    UI_BOLD = ("Segoe UI Semibold", 10)
+    HEAD_FONT = ("Segoe UI Semibold", 15)
+    LABEL_FONT = ("Consolas", 8)
+    MONO = ("Consolas", 9)
 
     class GuiUI:
         """Lets the engines (running in worker threads) talk to the window safely."""
@@ -1484,17 +1575,108 @@ def gui_main(_test_hook=None):
             self.app.q.put(("status", self.tab, ""))
 
         def confirm(self, question):
-            return self.app.call_main(lambda: messagebox.askyesno("Shardrip", question, parent=self.app.root))
+            return self.app.call_main(lambda: self.app.dialog(question, kind="confirm"))
 
         def ask_password(self):
-            return self.app.call_main(lambda: simpledialog.askstring(
-                "Password needed", "This file is password-locked.\nEnter the password:",
-                show="•", parent=self.app.root))
+            return self.app.call_main(lambda: self.app.dialog(
+                "This file is password-locked. Enter the password:", kind="password"))
 
         def start_progress(self, total, already=0, label=""):
             p = Progress(total, already, label)
             self.app.q.put(("progress", self.tab, p))
             return p
+
+    # ---------- small widget helpers ----------
+    def label(parent, text):
+        return tk.Label(parent, text=text.upper(), bg=T["card"], fg=T["label"], font=LABEL_FONT, anchor="w")
+
+    def entry(parent, var, show=None, mono=False):
+        e = tk.Entry(parent, textvariable=var, show=show or "", bg=T["input"], fg=T["fg"],
+                     insertbackground=T["fg"], relief="flat", font=MONO if mono else UI_FONT,
+                     highlightthickness=1, highlightbackground=T["input_line"], highlightcolor=T["accent"],
+                     disabledbackground=T["input"], disabledforeground=T["label"],
+                     readonlybackground=T["input"], selectbackground=T["accent_dim"], selectforeground=T["fg"])
+        return e
+
+    class Btn(tk.Label):
+        """Flat button that looks the same on every Windows version (tk.Button ignores colours on Windows)."""
+
+        def __init__(self, parent, text, command, kind="secondary", width=None):
+            super().__init__(parent, text=text, font=UI_BOLD, cursor="hand2", padx=14, pady=8,
+                             highlightthickness=1, width=width or 0)
+            self.command, self.kind, self.enabled = command, kind, True
+            self.bind("<Button-1>", lambda e: self.enabled and self.command())
+            self.bind("<Enter>", lambda e: self._paint(hover=True))
+            self.bind("<Leave>", lambda e: self._paint())
+            self._paint()
+
+        def _paint(self, hover=False):
+            if self.kind == "primary":
+                if self.enabled:
+                    bg = T["accent2"] if hover else T["accent"]
+                    self.configure(bg=bg, fg=T["ink"], highlightbackground=bg, cursor="hand2")
+                else:
+                    self.configure(bg=T["accent_dim"], fg="#6fa9bd", highlightbackground=T["accent_dim"],
+                                   cursor="arrow")
+            elif self.kind == "stop":
+                if self.enabled:
+                    self.configure(bg=T["hover"] if hover else T["card"], fg=T["danger"],
+                                   highlightbackground=T["danger"] if hover else "#5a2a35", cursor="hand2")
+                else:
+                    self.configure(bg=T["card"], fg="#3d4f6a", highlightbackground=T["line"], cursor="arrow")
+            else:
+                if self.enabled:
+                    self.configure(bg=T["hover"] if hover else T["input"], fg=T["accent"] if hover else T["muted"],
+                                   highlightbackground=T["accent"] if hover else T["input_line"], cursor="hand2")
+                else:
+                    self.configure(bg=T["input"], fg="#3d4f6a", highlightbackground=T["line"], cursor="arrow")
+
+        def set_enabled(self, on):
+            self.enabled = bool(on)
+            self._paint()
+
+        # compatibility with code/tests that read button state
+        def __getitem__(self, key):
+            if key == "state":
+                return "normal" if self.enabled else "disabled"
+            return super().__getitem__(key)
+
+    def check(parent, text, var, command=None):
+        return tk.Checkbutton(parent, text=text, variable=var, command=command, bg=T["card"], fg=T["fg"],
+                              activebackground=T["card"], activeforeground=T["fg"], selectcolor=T["input"],
+                              font=UI_FONT, highlightthickness=0, bd=0, cursor="hand2", anchor="w")
+
+    def log_box(parent, height):
+        wrap = tk.Frame(parent, bg=T["line"])
+        txt = tk.Text(wrap, height=height, bg=T["log"], fg="#9fb2cc", font=MONO, relief="flat", wrap="word",
+                      state="disabled", padx=10, pady=8, insertbackground=T["fg"], highlightthickness=0,
+                      selectbackground=T["accent_dim"])
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=txt.yview, style="Dark.Vertical.TScrollbar")
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y", padx=(0, 1), pady=1)
+        txt.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=1)
+        return wrap, txt
+
+    class Tabs:
+        """Top-bar tabs (Download / Send). .select(frame) works like a ttk.Notebook."""
+
+        def __init__(self, app):
+            self.app, self.frames, self.buttons = app, [], []
+
+        def add(self, frame, button):
+            self.frames.append(frame)
+            self.buttons.append(button)
+
+        def select(self, frame):
+            for f, b in zip(self.frames, self.buttons):
+                on = f is frame
+                if on:
+                    f.pack(fill="both", expand=True)
+                else:
+                    f.pack_forget()
+                b.configure(fg=T["accent"] if on else T["muted"],
+                            highlightbackground=T["accent"] if on else T["input_line"],
+                            bg="#0c2433" if on else T["top"])
 
     class App:
         def __init__(self, root):
@@ -1505,33 +1687,54 @@ def gui_main(_test_hook=None):
             self._row_vars = []
             self.share = None
             self.send_stop = None
-            root.title(f"Shardrip {VERSION}")
-            root.geometry("780x760")
-            root.minsize(680, 640)
+            self.scanner = None
+            root.title("Shardrip")
+            root.configure(bg=T["bg"])
+            root.geometry("860x900")
+            root.minsize(640, 640)
+            _dark_title_bar(root)
+
             style = ttk.Style()
-            if "vista" not in style.theme_names():
-                style.theme_use("clam")
-            style.configure("Big.TButton", padding=(14, 6))
-            style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"))
-            style.configure("Muted.TLabel", foreground="#666666")
-            style.configure("Shard.Horizontal.TProgressbar", background="#2e9d4f", troughcolor="#e6e6e6",
-                            thickness=16)
+            style.theme_use("clam")
+            style.configure("Shard.Horizontal.TProgressbar", background=T["accent"], troughcolor=T["input"],
+                            bordercolor=T["line"], lightcolor=T["accent"], darkcolor=T["accent"], thickness=10)
+            style.configure("Dark.Vertical.TScrollbar", background=T["input_line"], troughcolor=T["log"],
+                            bordercolor=T["log"], arrowcolor=T["muted"], lightcolor=T["input_line"],
+                            darkcolor=T["input_line"], gripcount=0)
+            style.map("Dark.Vertical.TScrollbar", background=[("active", "#2f4466")])
 
-            head = ttk.Frame(root, padding=(14, 10, 14, 0))
-            head.pack(fill="x")
-            ttk.Label(head, text="⚡ Shardrip", style="Title.TLabel").pack(side="left")
-            ttk.Label(head, text="  multi-connection downloader & file sender",
-                      style="Muted.TLabel").pack(side="left", pady=(6, 0))
+            # top bar
+            top = tk.Frame(root, bg=T["top"], height=56, highlightthickness=0)
+            top.pack(fill="x")
+            tk.Frame(root, bg=T["line"], height=1).pack(fill="x")
+            logo = tk.Canvas(top, width=30, height=30, bg=T["top"], highlightthickness=0)
+            logo.create_rectangle(0, 0, 30, 30, fill="#1b7fe8", outline="")
+            logo.create_polygon(0, 0, 30, 0, 0, 30, fill=T["accent"], outline="")
+            logo.create_text(15, 15, text="⚡", font=("Segoe UI Emoji", 12), fill="white")
+            logo.pack(side="left", padx=(18, 10), pady=13)
+            tk.Label(top, text="Shardrip", bg=T["top"], fg=T["head"], font=("Segoe UI Semibold", 12)).pack(side="left")
+            tk.Label(top, text=f"v{VERSION}", bg=T["top"], fg=T["label"], font=MONO).pack(side="right", padx=18)
 
-            nb = ttk.Notebook(root)
-            nb.pack(fill="both", expand=True, padx=12, pady=10)
-            self.dl_tab = ttk.Frame(nb, padding=12)
-            self.send_tab = ttk.Frame(nb, padding=12)
-            nb.add(self.dl_tab, text="  ⬇  Download  ")
-            nb.add(self.send_tab, text="  ⬆  Send  ")
-            self.nb = nb
+            body = tk.Frame(root, bg=T["bg"])
+            body.pack(fill="both", expand=True)
+            self.card = tk.Frame(body, bg=T["card"], highlightthickness=1, highlightbackground=T["line"])
+            self.card.pack(fill="both", expand=True, padx=26, pady=22)
+            inner = tk.Frame(self.card, bg=T["card"])
+            inner.pack(fill="both", expand=True, padx=24, pady=20)
+            self.dl_tab = tk.Frame(inner, bg=T["card"])
+            self.send_tab = tk.Frame(inner, bg=T["card"])
+
+            self.nb = Tabs(self)
+            for frame, text in ((self.dl_tab, "⬇  Download"), (self.send_tab, "⬆  Send")):
+                b = tk.Label(top, text=text, font=("Segoe UI Semibold", 9), padx=12, pady=4, cursor="hand2",
+                             highlightthickness=1, bg=T["top"])
+                b.pack(side="left", padx=(12 if frame is self.dl_tab else 6, 0))
+                b.bind("<Button-1>", lambda e, fr=frame: self.nb.select(fr))
+                self.nb.add(frame, b)
+
             self.build_download()
             self.build_send()
+            self.nb.select(self.dl_tab)
             root.protocol("WM_DELETE_WINDOW", self.on_close)
             root.after(100, self.poll)
 
@@ -1548,6 +1751,14 @@ def gui_main(_test_hook=None):
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
             self.root.update()
+            self.flash("Copied ✓")
+
+        def flash(self, text, ms=1800):
+            """Small toast at the bottom of the window."""
+            t = tk.Label(self.root, text=text, bg=T["card"], fg=T["fg"], font=UI_FONT, padx=16, pady=8,
+                         highlightthickness=1, highlightbackground=T["accent"])
+            t.place(relx=0.5, rely=1.0, y=-26, anchor="s")
+            self.root.after(ms, t.destroy)
 
         @staticmethod
         def log_to(widget, msg):
@@ -1556,58 +1767,106 @@ def gui_main(_test_hook=None):
             widget.see("end")
             widget.configure(state="disabled")
 
-        def row(self, parent, r, label, widget, extra=None):
-            ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", pady=4, padx=(0, 10))
-            widget.grid(row=r, column=1, sticky="ew", pady=4)
+        def heading(self, parent, title, sub):
+            tk.Label(parent, text=title, bg=T["card"], fg=T["head"], font=HEAD_FONT, anchor="w").pack(fill="x")
+            tk.Label(parent, text=sub, bg=T["card"], fg=T["muted"], font=UI_FONT, anchor="w").pack(fill="x", pady=(2, 4))
+
+        def field(self, parent, text, widget, extra=None, pady=(12, 0)):
+            box = tk.Frame(parent, bg=T["card"])
+            label(box, text + ":").pack(fill="x", pady=(0, 5))
+            row = tk.Frame(box, bg=T["card"])
+            row.pack(fill="x")
+            widget.pack(in_=row, side="left", fill="x", expand=True, ipady=7)
+            widget.lift(row)  # created before `row`, so raise it or the frame hides it
             if extra is not None:
-                extra.grid(row=r, column=2, sticky="w", padx=(8, 0), pady=4)
+                extra.pack(in_=row, side="left", padx=(8, 0))
+                extra.lift(row)
+            box.pack(fill="x", pady=pady)
+            return box
+
+        def dialog(self, text, kind="confirm"):
+            """Dark modal dialog. kind: confirm -> bool, password -> str/None."""
+            d = tk.Toplevel(self.root, bg=T["card"])
+            d.title("Shardrip")
+            d.transient(self.root)
+            d.resizable(False, False)
+            _dark_title_bar(d)
+            res = {"v": None if kind == "password" else False}
+            tk.Label(d, text=text, bg=T["card"], fg=T["fg"], font=UI_FONT, wraplength=380, justify="left").pack(
+                padx=22, pady=(20, 10), anchor="w")
+            pw = tk.StringVar()
+            if kind == "password":
+                e = entry(d, pw, show="•")
+                e.pack(fill="x", padx=22, ipady=7)
+                e.focus_set()
+            row = tk.Frame(d, bg=T["card"])
+            row.pack(fill="x", padx=22, pady=(16, 20))
+
+            def ok(*_):
+                res["v"] = pw.get() if kind == "password" else True
+                d.destroy()
+
+            def cancel(*_):
+                d.destroy()
+
+            Btn(row, "Unlock" if kind == "password" else "Yes", ok, "primary").pack(side="left", fill="x", expand=True)
+            Btn(row, "Cancel" if kind == "password" else "No", cancel).pack(side="left", fill="x", expand=True, padx=(8, 0))
+            d.bind("<Return>", ok)
+            d.bind("<Escape>", cancel)
+            d.update_idletasks()
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - d.winfo_width()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - d.winfo_height()) // 3
+            d.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+            d.grab_set()
+            self.root.wait_window(d)
+            return res["v"]
 
         # ---------- download tab ----------
         def build_download(self):
             f = self.dl_tab
-            form = ttk.Frame(f)
-            form.pack(fill="x")
-            form.columnconfigure(1, weight=1)
-
+            self.heading(f, "Download a file", "Paste a link, or scan / upload a Shardrip QR code.")
             self.url = tk.StringVar()
             self.mirrors = tk.StringVar()
             self.folder = tk.StringVar(value=default_download_dir())
             self.fname = tk.StringVar()
-            self.conns = tk.IntVar(value=16)
+            self.conns = tk.StringVar(value="16")
             self.sha = tk.StringVar()
             self.dl_pw = tk.StringVar()
             self._name_auto = True
 
-            self.row(form, 0, "Download URL", ttk.Entry(form, textvariable=self.url))
-            self.row(form, 1, "Extra mirrors", ttk.Entry(form, textvariable=self.mirrors))
-            ttk.Label(form, text="optional, separate with spaces", style="Muted.TLabel").grid(
-                row=2, column=1, sticky="w")
-            self.row(form, 3, "Save to", ttk.Entry(form, textvariable=self.folder),
-                     ttk.Button(form, text="Browse…", command=self.pick_folder))
-            name_entry = ttk.Entry(form, textvariable=self.fname)
+            self.field(f, "Download URL", entry(f, self.url), Btn(f, "📷  Scan QR", self.open_scanner))
+            self.field(f, "Save to", entry(f, self.folder), Btn(f, "Browse", self.pick_folder))
+            grid = tk.Frame(f, bg=T["card"])
+            grid.pack(fill="x")
+            grid.columnconfigure(0, weight=1, uniform="g")
+            grid.columnconfigure(1, weight=1, uniform="g")
+            cells = []
+            name_entry = entry(grid, self.fname)
             name_entry.bind("<Key>", lambda e: setattr(self, "_name_auto", False))
-            self.row(form, 4, "File name", name_entry)
-            self.row(form, 5, "Connections",
-                     ttk.Spinbox(form, from_=1, to=32, textvariable=self.conns, width=6))
-            self.row(form, 6, "SHA256 (optional)", ttk.Entry(form, textvariable=self.sha))
-            self.row(form, 7, "Password (locked files)", ttk.Entry(form, textvariable=self.dl_pw, show="•"))
+            self.dl_pw_entry = entry(grid, self.dl_pw, show="•")
+            for i, (t, w) in enumerate((("File name", name_entry), ("Connections", entry(grid, self.conns)),
+                                        ("Password (locked files)", self.dl_pw_entry),
+                                        ("SHA256 (optional)", entry(grid, self.sha, mono=True)))):
+                cell = tk.Frame(grid, bg=T["card"])
+                cell.grid(row=i // 2, column=i % 2, sticky="ew", padx=(0, 7) if i % 2 == 0 else (7, 0))
+                self.field(cell, t, w)
+                cells.append(cell)
+            self.field(f, "Extra mirrors (optional, separated by spaces)", entry(f, self.mirrors))
             self.url.trace_add("write", self.url_changed)
 
-            btns = ttk.Frame(f)
-            btns.pack(fill="x", pady=(10, 6))
-            self.dl_start = ttk.Button(btns, text="⬇  Start download", style="Big.TButton",
-                                       command=self.start_download)
-            self.dl_start.pack(side="left")
-            self.dl_stopbtn = ttk.Button(btns, text="■  Stop", style="Big.TButton",
-                                         command=self.stop_download, state="disabled")
-            self.dl_stopbtn.pack(side="left", padx=8)
+            self.dl_start = Btn(f, "⬇  Start download", self.start_download, "primary")
+            self.dl_start.pack(fill="x", pady=(20, 0))
+            self.dl_stopbtn = Btn(f, "■  Stop", self.stop_download, "stop")
+            self.dl_stopbtn.pack(fill="x", pady=(8, 0))
+            self.dl_stopbtn.set_enabled(False)
 
             self.dl_bar = ttk.Progressbar(f, maximum=100, style="Shard.Horizontal.TProgressbar")
-            self.dl_bar.pack(fill="x", pady=(6, 2))
-            self.dl_info = ttk.Label(f, text="Ready.")
-            self.dl_info.pack(anchor="w")
-            self.dl_log = ScrolledText(f, height=12, state="disabled", font=("Consolas", 9), wrap="word")
-            self.dl_log.pack(fill="both", expand=True, pady=(8, 0))
+            self.dl_bar.pack(fill="x", pady=(18, 0))
+            self.dl_info = tk.Label(f, text="Ready.", bg=T["card"], fg=T["muted"], font=UI_FONT, anchor="w",
+                                    justify="left", wraplength=740)
+            self.dl_info.pack(fill="x", pady=(8, 0))
+            wrap, self.dl_log = log_box(f, 7)
+            wrap.pack(fill="both", expand=True, pady=(12, 0))
 
         def url_changed(self, *_):
             if self._name_auto:
@@ -1622,23 +1881,23 @@ def gui_main(_test_hook=None):
         def start_download(self):
             url = self.url.get().strip().strip('"')
             if not url.lower().startswith(("http://", "https://")):
-                messagebox.showwarning("Shardrip", "Paste a direct http(s) download link first.", parent=self.root)
+                self.flash("Paste a download link (or scan a QR) first")
                 return
             urls = [url] + [m for m in self.mirrors.get().split() if m]
-            out = os.path.join(self.folder.get().strip(), self.fname.get().strip() or url_filename(url))
+            out = os.path.join(os.path.expanduser(self.folder.get().strip()),
+                               self.fname.get().strip() or url_filename(url))
             sha = self.sha.get().strip() or None
             if sha and (len(sha) != 64 or any(c not in "0123456789abcdefABCDEF" for c in sha)):
-                messagebox.showwarning("Shardrip", "That SHA256 doesn't look right (64 hex characters).",
-                                       parent=self.root)
+                self.flash("That SHA256 doesn't look right (64 hex characters)")
                 return
             try:
                 conns = max(1, min(32, int(self.conns.get())))
-            except (tk.TclError, ValueError):
+            except ValueError:
                 conns = 16
             pw = self.dl_pw.get() or None
             self.dl_stop = threading.Event()
-            self.dl_start.configure(state="disabled")
-            self.dl_stopbtn.configure(state="normal")
+            self.dl_start.set_enabled(False)
+            self.dl_stopbtn.set_enabled(True)
             self.dl_bar["value"] = 0
             self.dl_info.configure(text="Starting…")
             ui = GuiUI(self, "dl")
@@ -1658,68 +1917,202 @@ def gui_main(_test_hook=None):
                 self.dl_stop.set()
                 self.dl_info.configure(text="Stopping…")
 
+        # ---------- QR scanner (webcam + image upload) ----------
+        def use_scanned(self, text):
+            if not text or not text.lower().startswith(("http://", "https://")):
+                self.flash("That QR code isn't a download link")
+                return False
+            self.nb.select(self.dl_tab)
+            self._name_auto = True
+            self.url.set(text.strip())
+            locked = LOCK_EXT in urllib.parse.unquote(text.split("?")[0])
+            if locked:
+                self.dl_info.configure(text="🔒 Locked file - enter the password, then press Start download.")
+                self.dl_pw_entry.focus_set()
+                self.flash("🔒 Locked file - enter the password, then Start")
+            else:
+                self.dl_info.configure(text="Link filled ✓ - press Start download.")
+                self.flash("Link filled ✓")
+            return True
+
+        def upload_qr_image(self, path=None):
+            path = path or filedialog.askopenfilename(
+                parent=self.scanner or self.root, title="Choose a screenshot or photo of the QR code",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff"), ("All files", "*.*")])
+            if not path:
+                return False
+            try:
+                text = qr_from_image_file(path)
+            except Exception as e:
+                self.flash(f"Couldn't read that image: {e}")
+                return False
+            if not text:
+                self.flash("No QR code found in that image - try a clearer screenshot")
+                return False
+            self.close_scanner()
+            return self.use_scanned(text)
+
+        def open_scanner(self):
+            if self.scanner:
+                self.scanner.lift()
+                return
+            try:
+                cv2 = _cv2()
+            except Exception as e:
+                self.flash(f"QR scanning isn't available: {e}")
+                return
+            d = tk.Toplevel(self.root, bg=T["card"])
+            d.title("Scan or upload a QR code")
+            d.transient(self.root)
+            d.resizable(False, False)
+            _dark_title_bar(d)
+            self.scanner = d
+            tk.Label(d, text="Scan or upload a Shardrip QR code", bg=T["card"], fg=T["head"],
+                     font=("Segoe UI Semibold", 12)).pack(anchor="w", padx=20, pady=(16, 10))
+            self.cam_view = tk.Label(d, bg="#000000", width=480, height=360, text="Starting camera…",
+                                     fg=T["muted"], font=UI_FONT, compound="center")
+            self.cam_view.pack(padx=20)
+            self.cam_hint = tk.Label(d, text="Point your camera at the QR code, or upload a screenshot / photo of it.",
+                                     bg=T["card"], fg=T["muted"], font=UI_FONT, wraplength=480, justify="left")
+            self.cam_hint.pack(anchor="w", padx=20, pady=(10, 0))
+            row = tk.Frame(d, bg=T["card"])
+            row.pack(fill="x", padx=20, pady=(14, 18))
+            Btn(row, "🖼  Upload QR image", self.upload_qr_image, "primary").pack(side="left", fill="x", expand=True)
+            Btn(row, "Cancel", self.close_scanner).pack(side="left", fill="x", expand=True, padx=(8, 0))
+            d.protocol("WM_DELETE_WINDOW", self.close_scanner)
+            d.bind("<Escape>", lambda e: self.close_scanner())
+            d.update_idletasks()
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - d.winfo_reqwidth()) // 2
+            y = self.root.winfo_rooty() + 60
+            d.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+            self._cam = {"stop": threading.Event(), "frame": None, "result": None, "error": None}
+            cam = self._cam
+
+            def camera_thread():
+                cap = None
+                try:
+                    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if IS_WIN else cv2.VideoCapture(0)
+                    if not cap or not cap.isOpened():
+                        cam["error"] = "No camera found."
+                        return
+                    n = 0
+                    while not cam["stop"].is_set():
+                        ok, frame = cap.read()
+                        if not ok or frame is None:
+                            time.sleep(0.05)
+                            continue
+                        h, w = frame.shape[:2]
+                        s = 480 / max(w, 1)
+                        small = cv2.resize(frame, (480, max(1, int(h * s))))
+                        ok2, png = cv2.imencode(".png", small)
+                        if ok2:
+                            cam["frame"] = png.tobytes()
+                        n += 1
+                        if n % 3 == 0:
+                            text = qr_from_bgr(frame)
+                            if text:
+                                cam["result"] = text
+                                return
+                except Exception as e:
+                    cam["error"] = f"Couldn't open the camera ({e})."
+                finally:
+                    if cap is not None:
+                        cap.release()
+
+            threading.Thread(target=camera_thread, daemon=True).start()
+            self.root.after(60, self._scanner_tick)
+
+        def _scanner_tick(self):
+            if not self.scanner:
+                return
+            cam = self._cam
+            if cam["result"]:
+                text = cam["result"]
+                self.close_scanner()
+                self.use_scanned(text)
+                return
+            if cam["error"]:
+                self.cam_view.configure(image="", text="📷  " + cam["error"])
+                self.cam_hint.configure(text=cam["error"] + " Click “Upload QR image” and pick a screenshot or "
+                                                          "photo of the QR code instead.")
+                return
+            frame, cam["frame"] = cam["frame"], None
+            if frame:
+                import base64
+                img = tk.PhotoImage(data=base64.b64encode(frame).decode("ascii"))
+                self.cam_view.configure(image=img, text="", width=img.width(), height=img.height())
+                self.cam_view.image = img
+            self.root.after(60, self._scanner_tick)
+
+        def close_scanner(self):
+            if getattr(self, "_cam", None):
+                self._cam["stop"].set()
+            if self.scanner:
+                self.scanner.destroy()
+                self.scanner = None
+
         # ---------- send tab ----------
         def build_send(self):
             f = self.send_tab
-            form = ttk.Frame(f)
-            form.pack(fill="x")
-            form.columnconfigure(1, weight=1)
+            self.heading(f, "Send a file", "Share a file from this PC with a link - no port forwarding needed.")
             self.send_path = tk.StringVar()
-            self.port = tk.IntVar(value=8080)
+            self.port = tk.StringVar(value="8080")
             self.public = tk.BooleanVar(value=True)
             self.lock = tk.BooleanVar(value=False)
             self.send_pw = tk.StringVar()
 
-            self.row(form, 0, "File to send", ttk.Entry(form, textvariable=self.send_path),
-                     ttk.Button(form, text="Browse…", command=self.pick_file))
-            opts = ttk.Frame(form)
-            ttk.Label(opts, text="Port").pack(side="left")
-            ttk.Spinbox(opts, from_=1024, to=65535, textvariable=self.port, width=7).pack(side="left", padx=(6, 18))
-            ttk.Checkbutton(opts, text="Public internet link (Cloudflare)", variable=self.public).pack(side="left")
-            self.row(form, 1, "Options", opts)
-            lockf = ttk.Frame(form)
-            ttk.Checkbutton(lockf, text="Lock with password", variable=self.lock,
-                            command=self.lock_toggled).pack(side="left")
-            self.pw_entry = ttk.Entry(lockf, textvariable=self.send_pw, width=26, state="disabled")
-            self.pw_entry.pack(side="left", padx=8)
-            self.gen_btn = ttk.Button(lockf, text="Generate", command=lambda: self.send_pw.set(gen_password()),
-                                      state="disabled")
-            self.gen_btn.pack(side="left")
-            self.row(form, 2, "Security", lockf)
+            self.field(f, "File to send", entry(f, self.send_path), Btn(f, "Browse", self.pick_file))
+            row = tk.Frame(f, bg=T["card"])
+            row.pack(fill="x")
+            port_cell = tk.Frame(row, bg=T["card"])
+            port_cell.pack(side="left")
+            self.field(port_cell, "Port", entry(port_cell, self.port))
+            check(row, "  Public internet link", self.public).pack(side="left", padx=(18, 0), pady=(30, 0))
+            check(f, "  🔒 Lock with password", self.lock, self.lock_toggled).pack(anchor="w", pady=(14, 0))
+            self.pw_row = tk.Frame(f, bg=T["card"])
+            self.pw_entry = entry(self.pw_row, self.send_pw, mono=True)
+            self.pw_entry.pack(side="left", fill="x", expand=True, ipady=7)
+            self.gen_btn = Btn(self.pw_row, "Generate", lambda: self.send_pw.set(gen_password()))
+            self.gen_btn.pack(side="left", padx=(8, 0))
+            self.lock_note = tk.Label(f, text="🔒 Send the password separately from the link - e.g. text the link, "
+                                              "say the password. The receiver needs Shardrip to unlock it.",
+                                      bg="#1b1a12", fg=T["amber"], font=UI_FONT, justify="left", wraplength=740,
+                                      anchor="w", padx=12, pady=8, highlightthickness=1, highlightbackground="#6b5420")
+            self.send_actions = tk.Frame(f, bg=T["card"])
+            self.send_actions.pack(fill="x")
+            self.send_start = Btn(self.send_actions, "⬆  Start sharing", self.start_share, "primary")
+            self.send_start.pack(fill="x", pady=(20, 0))
+            self.send_stopbtn = Btn(self.send_actions, "■  Stop sharing", self.stop_share, "stop")
+            self.send_stopbtn.pack(fill="x", pady=(8, 0))
+            self.send_stopbtn.set_enabled(False)
+            self.send_info = tk.Label(f, text="Pick a file and press Start sharing.", bg=T["card"], fg=T["muted"],
+                                      font=UI_FONT, anchor="w", justify="left", wraplength=740)
+            self.send_info.pack(fill="x", pady=(10, 0))
 
-            btns = ttk.Frame(f)
-            btns.pack(fill="x", pady=(10, 6))
-            self.send_start = ttk.Button(btns, text="⬆  Start sharing", style="Big.TButton",
-                                         command=self.start_share)
-            self.send_start.pack(side="left")
-            self.send_stopbtn = ttk.Button(btns, text="■  Stop sharing", style="Big.TButton",
-                                           command=self.stop_share, state="disabled")
-            self.send_stopbtn.pack(side="left", padx=8)
-            self.send_info = ttk.Label(f, text="Pick a file and press Start sharing.")
-            self.send_info.pack(anchor="w", pady=(4, 6))
-
-            mid = ttk.Frame(f)
-            mid.pack(fill="both", expand=True)
-            self.links_frame = ttk.Frame(mid)
+            mid = tk.Frame(f, bg=T["card"])
+            mid.pack(fill="x", pady=(4, 0))
+            self.links_frame = tk.Frame(mid, bg=T["card"])
             self.links_frame.pack(side="left", fill="both", expand=True)
-            self.links_frame.columnconfigure(0, weight=1)
-            qrbox = ttk.Frame(mid)
-            qrbox.pack(side="right", padx=(12, 0), anchor="n")
-            self.qr = tk.Canvas(qrbox, width=220, height=220, bg="white", highlightthickness=1,
-                                highlightbackground="#cccccc")
-            self.qr.pack()
-            self.qr_label = ttk.Label(qrbox, text="QR code appears here", style="Muted.TLabel")
-            self.qr_label.pack(pady=(4, 0))
-
-            self.send_log = ScrolledText(f, height=7, state="disabled", font=("Consolas", 9), wrap="word")
-            self.send_log.pack(fill="both", expand=False, pady=(8, 0))
+            self.qrbox = tk.Frame(mid, bg=T["card"])
+            self.qr = tk.Canvas(self.qrbox, width=200, height=200, bg="white", highlightthickness=0)
+            self.qr.pack(pady=(12, 0))
+            self.qr_label = tk.Label(self.qrbox, text="Scan with a phone camera", bg=T["card"], fg=T["muted"],
+                                     font=("Segoe UI", 9))
+            self.qr_label.pack(pady=(6, 0))
+            wrap, self.send_log = log_box(f, 5)
+            wrap.pack(fill="both", expand=True, pady=(12, 0))
 
         def lock_toggled(self):
             on = self.lock.get()
-            self.pw_entry.configure(state="normal" if on else "disabled")
-            self.gen_btn.configure(state="normal" if on else "disabled")
-            if on and not self.send_pw.get():
-                self.send_pw.set(gen_password())
+            if on:
+                self.pw_row.pack(fill="x", pady=(10, 0), before=self.send_actions)
+                self.lock_note.pack(fill="x", pady=(10, 0), before=self.send_actions)
+                if not self.send_pw.get():
+                    self.send_pw.set(gen_password())
+            else:
+                self.pw_row.pack_forget()
+                self.lock_note.pack_forget()
 
         def pick_file(self):
             p = filedialog.askopenfilename(parent=self.root, title="Choose a file to send")
@@ -1731,18 +2124,20 @@ def gui_main(_test_hook=None):
                 w.destroy()
             self._row_vars = []
             self.qr.delete("all")
-            self.qr_label.configure(text="QR code appears here")
+            self.qrbox.pack_forget()
 
-        def add_copy_row(self, r, label, value, bold=False):
-            ttk.Label(self.links_frame, text=label, font=("Segoe UI", 9, "bold") if bold else None).grid(
-                row=r * 2, column=0, sticky="w", pady=(6, 0))
-            row = ttk.Frame(self.links_frame)
-            row.grid(row=r * 2 + 1, column=0, sticky="ew")
-            row.columnconfigure(0, weight=1)
+        def add_copy_row(self, label_text, value, highlight=False, password=False):
+            lab = tk.Label(self.links_frame, text=label_text.upper(), bg=T["card"],
+                           fg=T["accent"] if highlight else T["label"], font=LABEL_FONT, anchor="w")
+            lab.pack(fill="x", pady=(12, 5))
+            row = tk.Frame(self.links_frame, bg=T["card"])
+            row.pack(fill="x")
             var = tk.StringVar(value=value)
             self._row_vars.append(var)  # keep a reference, or Tk blanks the box
-            ttk.Entry(row, textvariable=var, state="readonly").grid(row=0, column=0, sticky="ew")
-            ttk.Button(row, text="Copy", width=6, command=lambda: self.copy(value)).grid(row=0, column=1, padx=(6, 0))
+            e = entry(row, var, mono=True)
+            e.configure(state="readonly", fg=T["amber"] if password else "#bcd0e8")
+            e.pack(side="left", fill="x", expand=True, ipady=6)
+            Btn(row, "Copy", lambda: self.copy(value)).pack(side="left", padx=(8, 0))
 
         def draw_qr(self, text):
             self.qr.delete("all")
@@ -1752,32 +2147,31 @@ def gui_main(_test_hook=None):
                 self.qr_label.configure(text=f"QR unavailable: {e}")
                 return
             n = len(m)
-            quiet = 3
-            px = max(1, 220 // (n + quiet * 2))
-            off = (220 - px * n) // 2
+            px = max(1, 200 // (n + 6))
+            off = (200 - px * n) // 2
             for y in range(n):
                 for x in range(n):
                     if m[y][x]:
                         self.qr.create_rectangle(off + x * px, off + y * px, off + (x + 1) * px,
                                                  off + (y + 1) * px, fill="black", width=0)
-            self.qr_label.configure(text="Scan with a phone camera")
+            self.qrbox.pack(side="right", padx=(18, 0), anchor="n")
 
         def start_share(self):
             path = self.send_path.get().strip().strip('"')
             if not os.path.isfile(path):
-                messagebox.showwarning("Shardrip", "Pick a file to send first.", parent=self.root)
+                self.flash("Pick a file to send first")
                 return
             pw = self.send_pw.get().strip() if self.lock.get() else None
             if self.lock.get() and not pw:
-                messagebox.showwarning("Shardrip", "Enter or generate a password for the lock.", parent=self.root)
+                self.flash("Enter or generate a password for the lock")
                 return
             try:
                 port = int(self.port.get())
-            except (tk.TclError, ValueError):
+            except ValueError:
                 port = 8080
             self.clear_links()
-            self.send_start.configure(state="disabled")
-            self.send_stopbtn.configure(state="normal")
+            self.send_start.set_enabled(False)
+            self.send_stopbtn.set_enabled(True)
             self.send_info.configure(text="Starting…")
             self.send_stop = threading.Event()
             ui = GuiUI(self, "send")
@@ -1801,23 +2195,14 @@ def gui_main(_test_hook=None):
 
         def show_share(self, share):
             self.share = share
-            r = 0
-            for label, link in share.links:
-                self.add_copy_row(r, label, link, bold=(r == 0))
-                r += 1
-            self.add_copy_row(r, "Receiver runs", share.receiver_cmd)
-            r += 1
+            for i, (lab, link) in enumerate(share.links):
+                self.add_copy_row(lab, link, highlight=(i == 0))
+            self.add_copy_row("Receiver runs", share.receiver_cmd)
             if share.password:
-                self.add_copy_row(r, "🔒 Password - send it separately from the link", share.password, bold=True)
-                r += 1
+                self.add_copy_row("🔒 Password - send it separately", share.password, highlight=True, password=True)
             elif share.sha256:
-                self.add_copy_row(r, "SHA256", share.sha256)
-                r += 1
+                self.add_copy_row("SHA256", share.sha256)
             self.draw_qr(share.main_link)
-            note = "Anyone with the link can download while sharing is on."
-            if share.password:
-                note += " Locked: receivers need Shardrip + the password."
-            self.send_info.configure(text=note)
             self.log_to(self.send_log, "Sharing is live ✅")
 
         def stop_share(self):
@@ -1827,8 +2212,8 @@ def gui_main(_test_hook=None):
             if share:
                 threading.Thread(target=share.stop, daemon=True).start()
                 self.log_to(self.send_log, "Sharing stopped.")
-            self.send_start.configure(state="normal")
-            self.send_stopbtn.configure(state="disabled")
+            self.send_start.set_enabled(True)
+            self.send_stopbtn.set_enabled(False)
             self.send_info.configure(text="Stopped. The link no longer works.")
 
         # ---------- event loop ----------
@@ -1850,8 +2235,8 @@ def gui_main(_test_hook=None):
                         finally:
                             ev.set()
                     elif kind == "dl_done":
-                        self.dl_start.configure(state="normal")
-                        self.dl_stopbtn.configure(state="disabled")
+                        self.dl_start.set_enabled(True)
+                        self.dl_stopbtn.set_enabled(False)
                         p = self.prog["dl"]
                         if p:
                             self.update_dl(p)
@@ -1860,13 +2245,13 @@ def gui_main(_test_hook=None):
                             self.dl_bar["value"] = 100
                             self.dl_info.configure(text=f"✅ Done: {item[1]}")
                         else:
-                            self.dl_info.configure(text="Stopped / not completed - see log.")
+                            self.dl_info.configure(text="Stopped / not completed - see the log below.")
                     elif kind == "shared":
                         self.show_share(item[1])
                     elif kind == "share_failed":
-                        self.send_start.configure(state="normal")
-                        self.send_stopbtn.configure(state="disabled")
-                        self.send_info.configure(text="Not sharing - see log.")
+                        self.send_start.set_enabled(True)
+                        self.send_stopbtn.set_enabled(False)
+                        self.send_info.configure(text="Not sharing - see the log below.")
             except queue.Empty:
                 pass
             p = self.prog["dl"]
@@ -1875,8 +2260,8 @@ def gui_main(_test_hook=None):
             if self.share:
                 sent, speed, active = self.share.stats.sample()
                 self.send_info.configure(
-                    text=f"Sharing ✅   Sent {human(sent)}   |   {human(speed)}/s ({speed * 8 / 1e6:.0f} Mbps)"
-                         f"   |   {active} active connection(s)")
+                    text=f"Sharing ✅   Sent {human(sent)}  ·  {human(speed)}/s ({speed * 8 / 1e6:.0f} Mbps)"
+                         f"  ·  {active} active connection(s)")
             self.root.after(250 if self.share else 100, self.poll)
 
         def update_dl(self, p):
@@ -1884,10 +2269,11 @@ def gui_main(_test_hook=None):
             self.dl_bar["value"] = pct
             pre = f"{p.label}: " if p.label else ""
             self.dl_info.configure(
-                text=f"{pre}{pct:.1f}%   ·   {human(done)} / {human(total)}   ·   "
-                     f"{human(speed)}/s ({speed * 8 / 1e6:.0f} Mbps)   ·   ETA {fmt_eta(eta)}")
+                text=f"{pre}{pct:.1f}%  ·  {human(done)} / {human(total)}  ·  "
+                     f"{human(speed)}/s ({speed * 8 / 1e6:.0f} Mbps)  ·  ETA {fmt_eta(eta)}")
 
         def on_close(self):
+            self.close_scanner()
             if self.dl_stop:
                 self.dl_stop.set()
             if self.share:

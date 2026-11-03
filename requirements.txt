@@ -1,3 +1,5 @@
 requests>=2.25
-# Only needed for Lock (password encryption). Shardrip installs it automatically on first use.
+# Only needed for Lock (password encryption). Installed automatically on first use.
 cryptography>=41
+# Only needed for QR scanning / reading QR images in the app. Installed automatically on first use.
+opencv-python-headless>=4.8
