@@ -58,7 +58,7 @@ jobs:
           gradle --no-daemon --stacktrace assembleRelease -Pabis=x86_64
           cp app/build/outputs/apk/release/app-release.apk ../Shardrip-x86_64-test.apk
 
-      - name: Build Shardrip.apk (phones - arm64 + arm32)
+      - name: Build Shardrip.apk (phones - 64-bit ARM)
         working-directory: android
         run: |
           gradle --no-daemon assembleRelease

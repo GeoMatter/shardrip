@@ -7,7 +7,7 @@ plugins {
 def shardripPy = file("../../shardrip.py")
 def appVersion = (shardripPy.text =~ /VERSION = "([0-9.]+)"/)[0][1]
 def parts = appVersion.tokenize(".").collect { it as int } + [0, 0]
-def abiList = (project.findProperty("abis") ?: "arm64-v8a,armeabi-v7a").split(",")
+def abiList = (project.findProperty("abis") ?: "arm64-v8a").split(",")
 
 android {
     namespace "com.geomatter.shardrip"
