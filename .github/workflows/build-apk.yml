@@ -68,8 +68,8 @@ jobs:
 
       - name: Start a sender on this machine (for the test)
         run: |
-          python -m pip install requests cryptography
-          head -c 25000000 /dev/urandom > ci-test.bin
+          python -m pip install requests cryptography pillow
+          head -c 150000000 /dev/urandom > ci-test.bin
           sha256sum ci-test.bin | cut -d' ' -f1 > ci-test.sha
           nohup python shardrip.py --serve ci-test.bin --password ci-pass-123 --no-tunnel --no-qr --port 8099 > serve.log 2>&1 &
           for i in $(seq 1 30); do grep -q "Same network" serve.log && break; sleep 1; done
