@@ -1,0 +1,59 @@
+plugins {
+    id "com.android.application"
+    id "com.chaquo.python"
+}
+
+// The app runs the exact same shardrip.py as the desktop version (copied in at build time).
+def shardripPy = file("../../shardrip.py")
+def appVersion = (shardripPy.text =~ /VERSION = "([0-9.]+)"/)[0][1]
+def parts = appVersion.tokenize(".").collect { it as int } + [0, 0]
+def abiList = (project.findProperty("abis") ?: "arm64-v8a").split(",")
+
+android {
+    namespace "com.geomatter.shardrip"
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.geomatter.shardrip"
+        minSdk 26
+        targetSdk 34
+        versionName appVersion
+        versionCode parts[0] * 10000 + parts[1] * 100 + parts[2]
+        ndk { abiFilters.addAll(abiList) }
+    }
+
+    signingConfigs {
+        release {
+            // Set by the GitHub workflow (from the SHARDRIP_KEYSTORE_B64 secret, or a temporary key).
+            storeFile file(System.getenv("SHARDRIP_KEYSTORE") ?: "missing.jks")
+            storePassword System.getenv("SHARDRIP_KEYSTORE_PASSWORD") ?: ""
+            keyAlias "shardrip"
+            keyPassword System.getenv("SHARDRIP_KEYSTORE_PASSWORD") ?: ""
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version "3.12"
+        buildPython System.getenv("SHARDRIP_BUILD_PYTHON") ?: "python3.12"
+        pip {
+            install "requests"
+            install "cryptography"
+        }
+    }
+}
+
+// Copy shardrip.py next to the app's own Python code (done while Gradle configures the build,
+// so it's always there before Chaquopy packs the Python sources).
+file("src/main/python/shardrip.py").setText(shardripPy.getText("UTF-8"), "UTF-8")

@@ -47,9 +47,10 @@ import urllib.parse
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-VERSION = "2.5"
+VERSION = "2.6"
 IS_WIN = platform.system() == "Windows"
 IS_ANDROID = "ANDROID_ROOT" in os.environ or "TERMUX_VERSION" in os.environ or sys.platform == "android"
+IS_APP = os.environ.get("SHARDRIP_APP") == "android"  # running inside Shardrip.apk
 NO_WINDOW = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW: no console pop-ups from the GUI
 
 # Packages that pip can't build on Android - Termux ships them ready-made instead.
@@ -57,6 +58,9 @@ TERMUX_PKGS = {"cryptography": "python-cryptography"}
 
 
 def default_download_dir():
+    forced = os.environ.get("SHARDRIP_DOWNLOAD_DIR")  # the Android app passes the phone's Download folder
+    if forced and os.path.isdir(forced):
+        return forced
     if IS_ANDROID:
         phone = os.path.expanduser("~/storage/downloads")  # created by `termux-setup-storage`
         if os.path.isdir(phone):
@@ -72,6 +76,8 @@ def ensure_package(pip_name, import_name=None):
     except ImportError:
         if getattr(sys, "frozen", False):
             raise RuntimeError(f"'{pip_name}' wasn't included when this Shardrip.exe was built")
+        if IS_APP:
+            raise RuntimeError(f"'{pip_name}' wasn't included when this Shardrip app was built")
         if IS_ANDROID and pip_name in TERMUX_PKGS:
             raise RuntimeError(f"'{pip_name}' is missing. In Termux run:  pkg install {TERMUX_PKGS[pip_name]}")
         print(f"Installing '{pip_name}' (one-time)...")
@@ -2759,7 +2765,7 @@ def make_web_handler(state, key, allowed_hosts):
                     return self.json(self.status())
                 if u.path == "/api/defaults":
                     return self.json({"folder": default_download_dir(), "home": os.path.expanduser("~"),
-                                      "android": IS_ANDROID, "windows": IS_WIN})
+                                      "android": IS_ANDROID, "windows": IS_WIN, "app": IS_APP})
                 if u.path == "/api/ls":
                     return self.json(_list_dir((qs.get("path") or [""])[0]))
             except Exception as e:
@@ -4125,7 +4131,7 @@ $("askNo").onclick = () => answer($("askPw").hidden ? false : "");
 $("askPw").onkeydown = e => { if (e.key === "Enter") $("askYes").click(); };
 
 // ---- live status ----
-let shownShare = null, shownQrs = [];
+let shownShare = null, shownQrs = [], appMode = false;
 function setLog(el, lines){ const atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
   const t = lines.join("\n"); if (el.textContent !== t) { el.textContent = t; if (atEnd) el.scrollTop = el.scrollHeight; } }
 async function poll(){
@@ -4160,14 +4166,18 @@ async function poll(){
       $("askNo").textContent = q.kind === "password" ? "Cancel" : "No"; $("ask").classList.add("on");
       if (q.kind === "password") setTimeout(() => $("askPw").focus(), 50); }
     if (!q && askId !== null) { askId = null; $("ask").classList.remove("on"); }
-  } catch (e) { $("dlStatus").textContent = "⚠️ Lost connection to Shardrip - is the terminal window still open?"; }
+  } catch (e) { $("dlStatus").textContent = appMode ? "⚠️ Lost connection to Shardrip - close the app and open it again."
+                                     : "⚠️ Lost connection to Shardrip - is the terminal window still open?"; }
   setTimeout(poll, 700);
 }
 $("links").onclick = e => { const b = e.target.closest("button[data-c]"); if (b) copy(b.dataset.c); };
 $("qrsw").onclick = e => { const b = e.target.closest("button[data-q]"); if (!b) return; const q = shownQrs[+b.dataset.q];
   if (!q) return; $("qr").innerHTML = q.svg; $("qrcap").textContent = "Scan with a phone camera · " + q.caption;
   for (const x of $("qrsw").children) x.classList.toggle("on", x === b); };
-api("/api/defaults").then(d => { $("folder").value = d.folder; }).catch(() => {});
+api("/api/defaults").then(d => { $("folder").value = d.folder;
+  if (d.app) { appMode = true; document.querySelector(".tab[data-t=send]").style.display = "none";  // the app is download-only (v1)
+    console.log("SHARDRIP app page ready, secure=" + window.isSecureContext + " camera=" + !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)); }
+}).catch(() => {});
 // ---- QR scanner: live camera (needs localhost/https) or a photo; BarcodeDetector if the browser has it, else jsQR ----
 let scanStream = null, scanTimer = null, scanBusy = false, detector = null;
 try { if ("BarcodeDetector" in window) detector = new BarcodeDetector({formats: ["qr_code"]}); } catch (e) { detector = null; }

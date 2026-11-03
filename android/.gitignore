@@ -1,0 +1,6 @@
+.gradle/
+build/
+app/build/
+local.properties
+*.jks
+app/src/main/python/shardrip.py
