@@ -21,6 +21,7 @@ It does the same job as paid "download accelerators" and "send large files" serv
 | **Resume** | Stop at any time (Ctrl+C, crash, power cut) and run it again to continue |
 | **SHA256 verification** | Confirms the download isn't corrupted or tampered with |
 | **Send mode** | Public `https` link via a free Cloudflare tunnel. No router changes |
+| **Smart links** | One link/QR: downloads straight over your Wi-Fi when you're near the sender (full speed), over the internet when you're not, and switches mid-download if you leave or come back |
 | **QR code** | Scan the send link with a phone, in the terminal or the window |
 | **Lock** | Password encryption (AES-256-GCM). Only someone with the password can read the file |
 | **GUI** | Download and Send tabs, progress bar, Copy buttons, QR code |
@@ -155,6 +156,7 @@ python shardrip.py URL [MIRROR2 MIRROR3 ...] -o FILE -c 16 --sha256 HASH
 | `--sha256` | Expected SHA256 hash to verify at the end | none |
 | `--password` | Password for a **locked** file (otherwise you're asked) | none |
 | `--overwrite` | Replace an existing file without asking | off (asks first) |
+| `--via` | For Shardrip smart links: `auto` (same network if possible, else internet), `lan` or `internet` | auto |
 
 **Example: Kali Linux ISO**
 
@@ -177,7 +179,9 @@ python shardrip.py --serve "C:\path\to\file.iso" --lock   # encrypted, password 
 ================================================================
   ⚡ SHARING - send the receiver one of these links:
 ================================================================
-  Internet (public link):
+  Smart link - Wi-Fi when nearby, internet otherwise:
+    https://random-words.trycloudflare.com/Xk3.../file.iso?lan=192.168.1.50:8080
+  Internet only:
     https://random-words.trycloudflare.com/Xk3.../file.iso
   Same network (LAN):
     http://192.168.1.50:8080/Xk3.../file.iso
@@ -185,7 +189,7 @@ python shardrip.py --serve "C:\path\to\file.iso" --lock   # encrypted, password 
   SHA256: db9cbed3...
 
   Receiver runs:
-    python shardrip.py "https://random-words.trycloudflare.com/Xk3.../file.iso" --sha256 db9cbed3...
+    python shardrip.py "https://random-words.trycloudflare.com/Xk3.../file.iso?lan=192.168.1.50:8080" --sha256 db9cbed3...
 ================================================================
   Scan to open the link on a phone:
 
@@ -205,6 +209,22 @@ python shardrip.py --serve "C:\path\to\file.iso" --lock   # encrypted, password 
 | `--no-qr` | Don't print the QR code | off |
 
 **How it works over the internet:** Shardrip starts a small file server on your PC and opens a free [Cloudflare Quick Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/). Your PC connects *out* to Cloudflare, so you need **no port forwarding, no router changes and no account**, and it works behind CGNAT. `cloudflared` (Cloudflare's official tunnel client) is downloaded automatically from its GitHub releases on first use.
+
+### Smart links (same Wi-Fi = full speed, automatically)
+
+The first link (and the QR code) is a **smart link**: the internet link with your PC's local addresses tucked on the end (`?lan=…`). A receiver using Shardrip 2.5+:
+
+| Situation | What happens |
+|---|---|
+| On the **same Wi-Fi/network** as the sender | Downloads **directly** over the local network - full Wi-Fi/LAN speed, never through your internet connection or its speed cap |
+| **Somewhere else** | Uses the internet (Cloudflare) link |
+| **Leaves** the network mid-download | Switches to the internet link and keeps going |
+| **Comes back** | Switches back to the local link (checked every 30 s) |
+
+- If your PC has **several adapters** (Wi-Fi, Ethernet, VPN), all its addresses are included and the receiver uses whichever one answers.
+- To force it: **Connect via** on the Download tab (*Auto* / *Same network only* / *Internet only*), or `--via auto|lan|internet` on the command line.
+- The Send tab's QR code has the same three choices.
+- **Old Shardrip versions and browsers just use the internet link** - a smart link always works as a normal link too.
 
 **Good to know:**
 - **Your upload speed is the limit.** Many home plans upload much slower than they download, and no number of connections can beat that.

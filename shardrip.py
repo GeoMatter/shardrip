@@ -28,6 +28,7 @@ import argparse
 import getpass
 import hashlib
 import http.server
+import ipaddress
 import json
 import math
 import os
@@ -46,7 +47,7 @@ import urllib.parse
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-VERSION = "2.4"
+VERSION = "2.5"
 IS_WIN = platform.system() == "Windows"
 IS_ANDROID = "ANDROID_ROOT" in os.environ or "TERMUX_VERSION" in os.environ or sys.platform == "android"
 NO_WINDOW = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW: no console pop-ups from the GUI
@@ -166,6 +167,124 @@ def sha256_file(path, on_progress=None, stop=None):
 
 def url_filename(url):
     return urllib.parse.unquote(os.path.basename(url.split("?")[0])) or "download.bin"
+
+
+# ----------------------------------------------------------------------------
+# Smart links: ONE link that downloads over the local network (Wi-Fi/LAN) when
+# the sender is on the same network, and over the internet (Cloudflare) when not:
+#     https://xxx.trycloudflare.com/TOKEN/file?lan=10.217.17.126:8080,192.168.1.5:8080
+# The ?lan= part is ignored by the sender's server, by browsers and by older
+# Shardrip versions, so a smart link always still works as a normal link.
+# ----------------------------------------------------------------------------
+VIA = {"auto": "Auto", "lan": "Same network only", "internet": "Internet only"}
+_TAILSCALE_NET = ipaddress.IPv4Network("100.64.0.0/10")
+
+
+def _local_ip_ok(host, tailscale=True):
+    """Only private (or Tailscale) IPv4 addresses count as local-network addresses."""
+    try:
+        ip = ipaddress.IPv4Address(host)
+    except ValueError:
+        return False
+    if ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+        return False
+    return ip.is_private or (tailscale and ip in _TAILSCALE_NET)
+
+
+def make_smart_link(base, hosts):
+    """Add local-network addresses ("ip:port") to a link. Leaves it plain if there are none."""
+    own = urllib.parse.urlsplit(base).netloc
+    hosts = [h for h in dict.fromkeys(hosts) if h != own]
+    return f"{base}?lan={','.join(hosts)}" if hosts else base
+
+
+def split_smart_link(url):
+    """-> (the link without the hint, [local-network URLs of the same file, best first])."""
+    parts = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    hints = ",".join(v for k, v in query if k == "lan")
+    rest = urllib.parse.urlencode([(k, v) for k, v in query if k != "lan"])
+    base = urllib.parse.urlunsplit(parts._replace(query=rest))
+    local = []
+    for h in hints.split(","):
+        host, _, port = h.strip().rpartition(":")
+        if host and port.isdigit() and 0 < int(port) < 65536 and _local_ip_ok(host):
+            u = urllib.parse.urlunsplit(("http", f"{host}:{int(port)}", parts.path, rest, ""))
+            if u not in local:
+                local.append(u)
+    return base, local[:6]
+
+
+def is_local_url(url):
+    return _local_ip_ok(urllib.parse.urlsplit(url).hostname or "")
+
+
+def first_reachable(urls, timeout=2.5):
+    """Quickly check several links at once; return the first (in order) that serves the file."""
+    if not urls:
+        return None
+
+    def ok(u):
+        try:
+            r = requests.get(u, headers={**UA, "Range": "bytes=0-0"}, stream=True,
+                             timeout=(timeout, timeout), allow_redirects=False)
+            r.close()
+            return r.status_code == 206
+        except requests.RequestException:
+            return False
+
+    with ThreadPoolExecutor(max_workers=len(urls)) as ex:
+        results = list(ex.map(ok, urls))
+    return next((u for u, good in zip(urls, results) if good), None)
+
+
+class Links:
+    """Which link each chunk downloads from.
+
+    Uses the local-network link while it works; if it stops answering (you left the
+    Wi-Fi) it switches to the internet link, and switches back when the local link
+    answers again (checked every RECHECK seconds in the background)."""
+    RECHECK = 30
+
+    def __init__(self, remote, local_candidates=(), local=None, extras=(), ui=None):
+        self.remote = list(remote)              # internet link (+ mirrors); empty = "same network only"
+        self.candidates = list(local_candidates)
+        self.local = local                      # local-network link in use, or None
+        self.extras = list(extras)
+        self.ui = ui
+        self.lock = threading.Lock()
+        self.next_check = time.time() + self.RECHECK
+        self.checking = False
+
+    def active(self):
+        return ([self.local] + self.extras) if self.local else self.remote
+
+    def pick(self, idx, attempt):
+        with self.lock:
+            if (not self.local and self.candidates and self.remote and not self.checking
+                    and time.time() >= self.next_check):
+                self.checking = True
+                threading.Thread(target=self._recheck, daemon=True).start()
+            urls = self.active()
+            return urls[(idx + attempt) % len(urls)]
+
+    def failed(self, url):
+        with self.lock:
+            if url == self.local and self.remote:
+                self.local = None
+                self.next_check = time.time() + self.RECHECK
+                if self.ui:
+                    self.ui.log("🌐 Lost the local network connection - switched to the internet link.")
+
+    def _recheck(self):
+        found = first_reachable(self.candidates)
+        with self.lock:
+            self.checking = False
+            self.next_check = time.time() + self.RECHECK
+            if found and not self.local:
+                self.local = found
+                if self.ui:
+                    self.ui.log("📶 The sender is reachable on your network again - switched to the local link.")
 
 
 def gen_password():
@@ -657,16 +776,18 @@ def decrypt_file(enc_path, out_path, password, ui, stop=None):
 # Download engine
 # ============================================================================
 
-def fetch_chunk(urls, idx, start, end, path, prog, stop, retries=6):
-    """Download bytes [start, end] into path at offset start. Rotates mirrors on failure."""
+def fetch_chunk(links, idx, start, end, path, prog, stop, retries=6):
+    """Download bytes [start, end] into path at offset start. Rotates mirrors / switches link on failure."""
+    if not isinstance(links, Links):
+        links = Links(links)
     for attempt in range(retries):
         if stop.is_set():
             raise Stopped()
-        url = urls[(idx + attempt) % len(urls)]
+        url = links.pick(idx, attempt)
         got = 0
         try:
             with session().get(url, headers={"Range": f"bytes={start}-{end}"},
-                               stream=True, timeout=30) as r:
+                               stream=True, timeout=(10, 30)) as r:
                 if r.status_code != 206:
                     raise IOError(f"HTTP {r.status_code} (link expired or no range support?)")
                 buf = bytearray()
@@ -687,6 +808,7 @@ def fetch_chunk(urls, idx, start, end, path, prog, stop, retries=6):
             raise
         except Exception as e:
             prog.add(-got)  # roll back progress for the failed attempt
+            links.failed(url)
             if attempt == retries - 1:
                 raise RuntimeError(f"chunk {idx} failed: {e}")
             if stop.wait(min(2 ** attempt, 15)):
@@ -708,26 +830,68 @@ def single_stream(url, path, size, ui, stop):
         prog.finish()
 
 
+def choose_links(urls, via, ui):
+    """Smart links: use the local network if the sender is on it, else the internet link."""
+    via = via if via in VIA else "auto"
+    base, local_urls = split_smart_link(urls[0])
+    extras = urls[1:]
+    if via == "internet":
+        local_urls = []
+    if via == "lan" and not local_urls:
+        if not is_local_url(base):
+            raise ValueError("This link has no same-network address (it's internet-only, or made by an older "
+                             "Shardrip). Choose Auto or Internet only.")
+        local_urls = [base]
+    local = None
+    if local_urls:
+        ui.log("Looking for the sender on your network...")
+        local = first_reachable(local_urls)
+        if local:
+            ui.log("📶 The sender is on your network - downloading directly over Wi-Fi/LAN (fastest).")
+        elif via == "lan":
+            raise IOError("Couldn't reach the sender on this network. Are you on the same Wi-Fi? "
+                          "(Or choose Auto / Internet only.)")
+        else:
+            ui.log("🌐 The sender isn't on your network - downloading over the internet link.")
+    remote = [] if via == "lan" else [base] + extras
+    return Links(remote, local_urls if via == "auto" else [], local, extras, ui)
+
+
 def download(urls, out, ui, connections=16, chunk_mb=16, sha256=None, password=None,
-             overwrite=False, stop=None):
-    """Download urls -> out. Returns the final file path, or None if cancelled/failed."""
+             overwrite=False, stop=None, via="auto"):
+    """Download urls -> out. Returns the final file path, or None if cancelled/failed.
+    via: "auto" (local network if the sender is on it, else internet), "lan" or "internet"."""
     stop = stop or threading.Event()
     out = os.path.abspath(out)
     state_path = out + ".state"
     os.makedirs(os.path.dirname(out), exist_ok=True)
 
-    size, ranges = probe(urls[0])
-    good = [urls[0]]
-    for u in urls[1:]:
+    links = choose_links(urls, via, ui)
+    first = links.active()[0]
+    size, ranges = probe(first)
+
+    def same_file(u):
         try:
             s, r = probe(u)
             if s == size and r:
-                good.append(u)
-            else:
-                ui.log(f"Skipping mirror (size/range mismatch): {u}")
+                return True
+            ui.log(f"Skipping mirror (size/range mismatch): {u}")
         except Exception as e:
             ui.log(f"Skipping mirror ({e}): {u}")
-    urls = good
+        return False
+
+    links.extras = [u for u in links.extras if same_file(u)]
+    if links.local:
+        # The internet link is only the backup: keep it if it serves the same file, quietly drop it if not.
+        base = links.remote[0] if links.remote else None
+        try:
+            ok = base is not None and probe(base) == (size, True)
+        except Exception:
+            ok = False
+        links.remote = ([base] if ok else []) + links.extras
+    else:
+        links.remote = [first] + links.extras
+    urls = links.active()
     ui.log(f"File: {out}\nSize: {human(size)}  Mirrors: {len(urls)}  Connections: {connections}")
 
     # Never silently wipe a file that's already there (e.g. a finished download).
@@ -785,7 +949,7 @@ def download(urls, out, ui, connections=16, chunk_mb=16, sha256=None, password=N
         todo = [c for c in chunks if c[0] not in done]
         failed = []
         pool = ThreadPoolExecutor(max_workers=connections)
-        pending = {pool.submit(fetch_chunk, urls, i, s, e, out, prog, stop) for i, s, e in todo}
+        pending = {pool.submit(fetch_chunk, links, i, s, e, out, prog, stop) for i, s, e in todo}
         try:
             # Poll with a short timeout so Ctrl+C / Stop is noticed quickly
             while pending and not stop.is_set():
@@ -884,6 +1048,19 @@ def lan_ip():
         return ip
     except OSError:
         return "127.0.0.1"
+
+
+def lan_ips():
+    """Every local-network IPv4 address this device has, best guess first.
+    (PCs often have several adapters - Wi-Fi, Ethernet, VPNs - so one guess can be the wrong one.)"""
+    best = lan_ip()
+    found = [best]
+    try:
+        found += [a[4][0] for a in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)]
+    except OSError:
+        pass
+    ips = [ip for ip in dict.fromkeys(found) if _local_ip_ok(ip, tailscale=False)]
+    return ips[:4] or [best]
 
 
 def tailscale_ip():
@@ -1107,6 +1284,7 @@ class Share:
         self.ui, self.port, self.tunnel, self.password = ui, port, tunnel, password
         self.stats = ServeStats()
         self.links, self.sha256, self.server, self.tunnel_proc = [], None, None, None
+        self.lan_link = self.internet_link = self.smart_link = None
 
     def start(self, stop=None):
         if not os.path.isfile(self.path):
@@ -1138,24 +1316,50 @@ class Share:
             raise OSError(f"Port {self.port} is in use or blocked ({e}). Try a different port.")
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-        self.links = [("Same network (LAN)", f"http://{lan_ip()}:{self.port}{link_path}")]
+        ips = lan_ips()
         ts = tailscale_ip()
+        hosts = [f"{ip}:{self.port}" for ip in ips] + ([f"{ts}:{self.port}"] if ts else [])
+        self.lan_link = f"http://{ips[0]}:{self.port}{link_path}"
+        self.links = [("Same network (LAN)", self.lan_link)]
+        self.links += [("Same network (other adapter)", f"http://{ip}:{self.port}{link_path}") for ip in ips[1:]]
         if ts:
             self.links.append(("Tailscale", f"http://{ts}:{self.port}{link_path}"))
+        self.internet_link = None
         if self.tunnel:
             if stop is not None and stop.is_set():
                 raise Stopped()
             self.ui.log("Opening a public Cloudflare tunnel (no port forwarding needed)...")
             self.tunnel_proc, public = start_tunnel(self.port, self.ui)
             if public:
-                self.links.insert(0, ("Internet (public link)", public + link_path))
+                self.internet_link = public + link_path
+                self.links.insert(0, ("Internet only", self.internet_link))
             else:
                 self.ui.log("Tunnel didn't start. LAN/Tailscale links still work.")
+        # The smart link: local network when the receiver is on it, internet otherwise.
+        self.smart_link = make_smart_link(self.internet_link or self.lan_link, hosts)
+        if self.smart_link not in (self.internet_link, self.lan_link):
+            self.links.insert(0, ("Smart link - Wi-Fi when nearby, internet otherwise", self.smart_link))
         return self
 
     @property
     def main_link(self):
         return self.links[0][1] if self.links else ""
+
+    @property
+    def qr_links(self):
+        """[(key, button text, caption, link)] for the QR code switcher."""
+        if self.smart_link == self.lan_link:
+            caption = "Same Wi-Fi/network only"
+        elif self.internet_link:
+            caption = "Works anywhere - uses Wi-Fi when nearby"
+        else:
+            caption = "Same network - tries every address"
+        out = [("auto", "Auto", caption, self.main_link)]
+        if self.smart_link != self.lan_link:
+            out.append(("lan", "Same network", "Same Wi-Fi/network only (fastest)", self.lan_link))
+        if self.internet_link and self.smart_link != self.internet_link:
+            out.append(("internet", "Internet", "Internet link only", self.internet_link))
+        return out
 
     @property
     def receiver_cmd(self):
@@ -1246,6 +1450,21 @@ def self_test():
 
     check("qr scan / upload reader (OpenCV)", qr_reader)
 
+    def smart_links():
+        base = "https://example-test-words.trycloudflare.com/AbC123/my%20file.zip.shardlock"
+        smart = make_smart_link(base, ["10.217.17.126:8080", "192.168.1.250:8080", "8.8.8.8:80", "bad"])
+        b, local = split_smart_link(smart)
+        assert b == base, b
+        assert local == ["http://10.217.17.126:8080/AbC123/my%20file.zip.shardlock",
+                         "http://192.168.1.250:8080/AbC123/my%20file.zip.shardlock"], local  # public IP dropped
+        assert url_filename(smart) == "my file.zip.shardlock"
+        links = Links([base], local, local[0])
+        assert links.pick(0, 0) == local[0]
+        links.failed(local[0])
+        assert links.pick(0, 0) == base, "didn't switch to the internet link"
+
+    check("smart links (same network first, internet fallback)", smart_links)
+
     def tk_window():
         import tkinter
         r = tkinter.Tk()
@@ -1307,11 +1526,11 @@ class ConsoleUI:
         return p
 
 
-def cli_download(urls, output, connections, chunk_mb, sha256, password, overwrite):
+def cli_download(urls, output, connections, chunk_mb, sha256, password, overwrite, via="auto"):
     ui = ConsoleUI()
     out = output or url_filename(urls[0])
     try:
-        return download(urls, out, ui, connections, chunk_mb, sha256, password, overwrite) is not None
+        return download(urls, out, ui, connections, chunk_mb, sha256, password, overwrite, via=via) is not None
     except KeyboardInterrupt:
         os._exit(1)  # progress is saved; kill worker threads immediately
 
@@ -1641,6 +1860,27 @@ def gui_main(_test_hook=None):
                 return "normal" if self.enabled else "disabled"
             return super().__getitem__(key)
 
+    def segmented(parent, var, options, small=False):
+        """Row of toggle buttons bound to a StringVar: options = [(value, text)]."""
+        box = tk.Frame(parent, bg=T["card"])
+        btns = {}
+
+        def paint(*_):
+            for k, b in btns.items():
+                on = var.get() == k
+                b.configure(bg="#0c2433" if on else T["input"], fg=T["accent"] if on else T["muted"],
+                            highlightbackground=T["accent"] if on else T["input_line"])
+
+        for k, text in options:
+            b = tk.Label(box, text=text, font=("Segoe UI", 8) if small else UI_FONT, padx=8 if small else 12,
+                         pady=3 if small else 7, cursor="hand2", highlightthickness=1)
+            b.pack(side="left", padx=(0, 4 if small else 6))
+            b.bind("<Button-1>", lambda e, k=k: var.set(k))
+            btns[k] = b
+        var.trace_add("write", paint)
+        paint()
+        return box
+
     def check(parent, text, var, command=None):
         return tk.Checkbutton(parent, text=text, variable=var, command=command, bg=T["card"], fg=T["fg"],
                               activebackground=T["card"], activeforeground=T["fg"], selectcolor=T["input"],
@@ -1832,6 +2072,7 @@ def gui_main(_test_hook=None):
             self.conns = tk.StringVar(value="16")
             self.sha = tk.StringVar()
             self.dl_pw = tk.StringVar()
+            self.via = tk.StringVar(value="auto")
             self._name_auto = True
 
             self.field(f, "Download URL", entry(f, self.url), Btn(f, "📷  Scan QR", self.open_scanner))
@@ -1852,6 +2093,14 @@ def gui_main(_test_hook=None):
                 self.field(cell, t, w)
                 cells.append(cell)
             self.field(f, "Extra mirrors (optional, separated by spaces)", entry(f, self.mirrors))
+            via_row = tk.Frame(f, bg=T["card"])
+            via_box = segmented(via_row, self.via, [(k, VIA[k]) for k in VIA])
+            via_box.pack(side="left")
+            self.via_hint = tk.Label(via_row, bg=T["card"], fg=T["muted"], font=("Segoe UI", 9), anchor="w")
+            self.via_hint.pack(side="left", padx=(6, 0))
+            self.field(f, "Connect via (for Shardrip smart links)", via_row)
+            self.via.trace_add("write", self.via_changed)
+            self.via_changed()
             self.url.trace_add("write", self.url_changed)
 
             self.dl_start = Btn(f, "⬇  Start download", self.start_download, "primary")
@@ -1867,6 +2116,12 @@ def gui_main(_test_hook=None):
             self.dl_info.pack(fill="x", pady=(8, 0))
             wrap, self.dl_log = log_box(f, 7)
             wrap.pack(fill="both", expand=True, pady=(12, 0))
+
+        def via_changed(self, *_):
+            self.via_hint.configure(text={
+                "auto": "same Wi-Fi as the sender → direct & fast, otherwise internet",
+                "lan": "only over the local network - fails away from it",
+                "internet": "always through the internet link"}[self.via.get()])
 
         def url_changed(self, *_):
             if self._name_auto:
@@ -1895,6 +2150,7 @@ def gui_main(_test_hook=None):
             except ValueError:
                 conns = 16
             pw = self.dl_pw.get() or None
+            via = self.via.get()
             self.dl_stop = threading.Event()
             self.dl_start.set_enabled(False)
             self.dl_stopbtn.set_enabled(True)
@@ -1904,7 +2160,7 @@ def gui_main(_test_hook=None):
 
             def work():
                 try:
-                    res = download(urls, out, ui, conns, 16, sha, pw, False, self.dl_stop)
+                    res = download(urls, out, ui, conns, 16, sha, pw, False, self.dl_stop, via=via)
                 except Exception as e:
                     ui.log(f"❌ Error: {e}")
                     res = None
@@ -2098,8 +2354,11 @@ def gui_main(_test_hook=None):
             self.qr = tk.Canvas(self.qrbox, width=200, height=200, bg="white", highlightthickness=0)
             self.qr.pack(pady=(12, 0))
             self.qr_label = tk.Label(self.qrbox, text="Scan with a phone camera", bg=T["card"], fg=T["muted"],
-                                     font=("Segoe UI", 9))
+                                     font=("Segoe UI", 9), wraplength=210, justify="center")
             self.qr_label.pack(pady=(6, 0))
+            self.qr_choice = tk.StringVar(value="auto")
+            self.qr_choice.trace_add("write", self.qr_choice_changed)
+            self.qr_switch = None
             wrap, self.send_log = log_box(f, 5)
             wrap.pack(fill="both", expand=True, pady=(12, 0))
 
@@ -2124,6 +2383,9 @@ def gui_main(_test_hook=None):
                 w.destroy()
             self._row_vars = []
             self.qr.delete("all")
+            if self.qr_switch is not None:
+                self.qr_switch.destroy()
+                self.qr_switch = None
             self.qrbox.pack_forget()
 
         def add_copy_row(self, label_text, value, highlight=False, password=False):
@@ -2202,8 +2464,24 @@ def gui_main(_test_hook=None):
                 self.add_copy_row("🔒 Password - send it separately", share.password, highlight=True, password=True)
             elif share.sha256:
                 self.add_copy_row("SHA256", share.sha256)
-            self.draw_qr(share.main_link)
+            choices = share.qr_links
+            if len(choices) > 1:
+                self.qr_switch = segmented(self.qrbox, self.qr_choice, [(k, t) for k, t, _, _ in choices], small=True)
+                self.qr_switch.pack(pady=(8, 0))
+            if self.qr_choice.get() == "auto":
+                self.qr_choice_changed()
+            else:
+                self.qr_choice.set("auto")
             self.log_to(self.send_log, "Sharing is live ✅")
+
+        def qr_choice_changed(self, *_):
+            if not self.share:
+                return
+            for k, _t, caption, link in self.share.qr_links:
+                if k == self.qr_choice.get():
+                    self.draw_qr(link)
+                    self.qr_label.configure(text=f"Scan with a phone camera\n{caption}")
+                    return
 
         def stop_share(self):
             if self.send_stop:
@@ -2536,13 +2814,15 @@ def make_web_handler(state, key, allowed_hosts):
             except (TypeError, ValueError):
                 conns = 16
             pw = b.get("password") or None
+            via = str(b.get("via") or "auto")
             state.dl_stop = stop = threading.Event()
             tab.running, tab.result, tab.progress, tab.status = True, None, None, "Starting…"
             ui = WebUI(state, "dl", stop)
 
             def work():
                 try:
-                    tab.result = download(urls, os.path.join(folder, name), ui, conns, 16, sha, pw, False, stop)
+                    tab.result = download(urls, os.path.join(folder, name), ui, conns, 16, sha, pw, False, stop,
+                                          via=via)
                 except Exception as e:
                     ui.log(f"❌ Error: {e}")
                 finally:
@@ -2582,6 +2862,8 @@ def make_web_handler(state, key, allowed_hosts):
                         "links": [{"label": l, "url": u} for l, u in share.links],
                         "receiver_cmd": share.receiver_cmd, "password": share.password,
                         "sha256": share.sha256, "qr": qr_svg(share.main_link),
+                        "qrs": [{"key": k, "label": t, "caption": c, "svg": qr_svg(u)}
+                                for k, t, c, u in share.qr_links],
                     }
                     ui.log("Sharing is live ✅")
                 except Exception as e:
@@ -3616,7 +3898,7 @@ box-shadow:0 10px 30px rgba(0,0,0,.25)}
 .sub{margin:4px 0 6px;color:var(--muted);font-size:13px}
 label{display:block;margin:16px 0 6px;font:500 11px/1.2 ui-monospace,"Cascadia Mono",Consolas,monospace;
 text-transform:uppercase;letter-spacing:.09em;color:var(--label)}
-input[type=text],input[type=password],input[type=number]{width:100%;min-width:0;padding:11px 13px;border-radius:8px;
+input[type=text],input[type=password],input[type=number],select{width:100%;min-width:0;padding:11px 13px;border-radius:8px;
 border:1px solid var(--input-line);background:var(--input);color:var(--fg);font:14px var(--font);outline:none;transition:.15s}
 input::placeholder{color:var(--ph)}
 input:focus{border-color:var(--accent);box-shadow:0 0 0 3px #00c2f526}
@@ -3655,6 +3937,11 @@ pre.log:empty{display:none}
 .qr{background:#fff;border-radius:12px;padding:8px;margin-top:12px;box-shadow:0 0 0 1px var(--line),0 8px 24px rgba(0,0,0,.35)}
 .qr svg{display:block;width:100%}
 .qrcap{text-align:center;font-size:12px;color:var(--muted);margin-top:8px}
+.seg{display:flex;gap:6px;flex-wrap:wrap}
+.seg button{padding:8px 12px;font-size:13px}
+.seg button.on{color:var(--accent);border-color:var(--accent);background:#0c2433}
+.qrsw{margin-top:8px;gap:4px}.qrsw button{flex:1;padding:6px 4px;font-size:12px}
+.vhint{font-size:12px;color:var(--muted);margin-top:6px}
 .pw{color:var(--amber)!important;font:600 15px ui-monospace,Consolas,monospace!important}
 .hint{font-size:13px;color:var(--muted);margin-top:10px}
 
@@ -3709,6 +3996,9 @@ pointer-events:none;z-index:10;box-shadow:0 10px 30px rgba(0,0,0,.4);max-width:9
     <div><label>SHA256 (optional):</label><input type="text" id="sha" autocomplete="off" placeholder="to verify the file"></div>
   </div>
   <label>Extra mirrors (optional):</label><input type="text" id="mirrors" autocomplete="off" placeholder="more links to the same file, separated by spaces">
+  <label>Connect via (for Shardrip smart links):</label>
+  <div class="seg" id="via"><button data-v="auto" class="on">Auto</button><button data-v="lan">Same network only</button><button data-v="internet">Internet only</button></div>
+  <div class="vhint" id="viaHint">Same Wi-Fi as the sender → direct &amp; fast, otherwise internet.</div>
   <div class="actions"><button class="primary" id="dlStart">⬇ Start download</button><button class="stop" id="dlStop" disabled>■ Stop</button></div>
   <div class="bar"><div id="dlBar"></div></div>
   <div class="status" id="dlStatus">Ready.</div>
@@ -3730,7 +4020,7 @@ pointer-events:none;z-index:10;box-shadow:0 10px 30px rgba(0,0,0,.4);max-width:9
   <div class="actions"><button class="primary" id="sendStart">⬆ Start sharing</button><button class="stop" id="sendStop" disabled>■ Stop sharing</button></div>
   <div class="status" id="sendStatus">Pick a file and press Start sharing.</div>
   <div class="share" id="shareBox" hidden><div class="links" id="links"></div>
-    <div><div class="qr" id="qr"></div><div class="qrcap">Scan with a phone camera</div></div></div>
+    <div><div class="qr" id="qr"></div><div class="seg qrsw" id="qrsw"></div><div class="qrcap" id="qrcap">Scan with a phone camera</div></div></div>
   <pre class="log" id="sendLog"></pre>
 </section>
 </main>
@@ -3778,9 +4068,15 @@ let nameAuto = true;
 $("name").oninput = () => nameAuto = false;
 $("url").oninput = () => { if (!nameAuto) return; try { const u = new URL($("url").value.trim());
   $("name").value = decodeURIComponent(u.pathname.split("/").pop() || ""); } catch (e) { $("name").value = ""; } };
+let via = "auto";
+const VIA_HINT = {auto: "Same Wi-Fi as the sender → direct & fast, otherwise internet.",
+  lan: "Only over the local network - fails away from it.", internet: "Always through the internet link."};
+$("via").onclick = e => { const b = e.target.closest("button[data-v]"); if (!b) return; via = b.dataset.v;
+  for (const x of $("via").children) x.classList.toggle("on", x === b); $("viaHint").textContent = VIA_HINT[via]; };
 $("dlStart").onclick = async () => {
   try { await api("/api/download", {url: $("url").value, folder: $("folder").value, name: $("name").value,
-          connections: +$("conns").value, password: $("dlpw").value, mirrors: $("mirrors").value, sha256: $("sha").value});
+          connections: +$("conns").value, password: $("dlpw").value, mirrors: $("mirrors").value, sha256: $("sha").value,
+          via});
         $("dlBar").style.width = "0"; }
   catch (e) { toast(e.message); }
 };
@@ -3829,7 +4125,7 @@ $("askNo").onclick = () => answer($("askPw").hidden ? false : "");
 $("askPw").onkeydown = e => { if (e.key === "Enter") $("askYes").click(); };
 
 // ---- live status ----
-let shownShare = null;
+let shownShare = null, shownQrs = [];
 function setLog(el, lines){ const atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
   const t = lines.join("\n"); if (el.textContent !== t) { el.textContent = t; if (atEnd) el.scrollTop = el.scrollHeight; } }
 async function poll(){
@@ -3853,7 +4149,10 @@ async function poll(){
         else if (sh.sha256) rows.push(["SHA256", sh.sha256]);
         $("links").innerHTML = rows.map(([t, v, b, pw]) => `<div class="lnk"><div class="t">${b ? "<b>" + esc(t) + "</b>" : esc(t)}</div>
           <div class="row"><input type="text" readonly value="${esc(v)}" class="${pw ? "pw" : ""}"><button data-c="${esc(v)}">Copy</button></div></div>`).join("");
-        $("qr").innerHTML = sh.qr;
+        $("qr").innerHTML = sh.qr; $("qrcap").textContent = "Scan with a phone camera";
+        const qrs = sh.qrs || []; shownQrs = qrs;
+        $("qrsw").innerHTML = qrs.length > 1 ? qrs.map((q, i) => `<button data-q="${i}" class="${i ? "" : "on"}">${esc(q.label)}</button>`).join("") : "";
+        if (qrs.length > 1) $("qrcap").textContent = "Scan with a phone camera · " + qrs[0].caption;
       } }
     const q = s.question;
     if (q && q.id !== askId) { askId = q.id; $("askText").textContent = q.text; $("askPw").hidden = q.kind !== "password";
@@ -3865,6 +4164,9 @@ async function poll(){
   setTimeout(poll, 700);
 }
 $("links").onclick = e => { const b = e.target.closest("button[data-c]"); if (b) copy(b.dataset.c); };
+$("qrsw").onclick = e => { const b = e.target.closest("button[data-q]"); if (!b) return; const q = shownQrs[+b.dataset.q];
+  if (!q) return; $("qr").innerHTML = q.svg; $("qrcap").textContent = "Scan with a phone camera · " + q.caption;
+  for (const x of $("qrsw").children) x.classList.toggle("on", x === b); };
 api("/api/defaults").then(d => { $("folder").value = d.folder; }).catch(() => {});
 // ---- QR scanner: live camera (needs localhost/https) or a photo; BarcodeDetector if the browser has it, else jsQR ----
 let scanStream = null, scanTimer = null, scanBusy = false, detector = null;
@@ -3942,6 +4244,9 @@ def main():
     ap.add_argument("--sha256", help="expected SHA256 to verify at the end")
     ap.add_argument("--password", help="download: unlock a locked file / send: lock with this password")
     ap.add_argument("--overwrite", action="store_true", help="replace an existing output file without asking")
+    ap.add_argument("--via", choices=list(VIA), default="auto",
+                    help="smart links: auto = same network if the sender is on it, else internet (default); "
+                         "lan = same network only; internet = internet link only")
     ap.add_argument("--serve", metavar="FILE", help="SEND mode: share FILE so someone else can download it")
     ap.add_argument("--lock", action="store_true", help="--serve with a generated password (encrypts the file)")
     ap.add_argument("--port", type=int, default=8080, help="port for --serve (default 8080)")
@@ -3977,7 +4282,8 @@ def main():
     if a.serve:
         password = a.password or (gen_password() if a.lock else None)
         return cli_serve(a.serve, a.port, not a.no_tunnel, password, show_qr=not a.no_qr)
-    return cli_download(a.urls, a.output, a.connections, a.chunk_mb, a.sha256, a.password, a.overwrite)
+    return cli_download(a.urls, a.output, a.connections, a.chunk_mb, a.sha256, a.password, a.overwrite,
+                        getattr(a, "via", "auto"))
 
 
 if __name__ == "__main__":
