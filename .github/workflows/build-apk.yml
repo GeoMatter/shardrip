@@ -75,7 +75,8 @@ jobs:
           for i in $(seq 1 30); do grep -q "Same network" serve.log && break; sleep 1; done
           cat serve.log
           # the emulator reaches this machine at 10.0.2.2
-          grep -A1 "Same network (LAN)" serve.log | tail -1 | sed -E 's#http://[0-9.]+:#http://10.0.2.2:#; s/^ +//' > link.txt
+          tr '\r' '\n' < serve.log | grep -A1 "Same network (LAN):" | sed -n 2p | grep -o 'http://[^ ]*' \
+            | sed -E 's#http://[0-9.]+:#http://10.0.2.2:#' > link.txt
           cat link.txt
 
       - name: Enable KVM (fast emulator)
