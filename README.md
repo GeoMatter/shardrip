@@ -25,7 +25,8 @@ It does the same job as paid "download accelerators" and "send large files" serv
 | **QR code** | Scan the send link with a phone, in the terminal or the window |
 | **Lock** | Password encryption (AES-256-GCM). Only someone with the password can read the file |
 | **GUI** | Download and Send tabs, progress bar, Copy buttons, QR code |
-| **Web interface** | The same app in any browser, phone-friendly. Runs on Android via Termux |
+| **Web interface** | The same app in any browser, phone-friendly |
+| **Android app** | `Shardrip.apk`: download with QR scan, smart links and background downloads |
 | **QR scanner** | In the web interface: scan the sender's QR with your camera, and the link fills itself in |
 | **Safe by default** | Never overwrites a finished file without asking. Detects if a file changed on the server before resuming |
 | **One file** | Needs `requests` (and `cryptography` for Lock). Both install themselves on first use |
@@ -120,9 +121,24 @@ On the **⬇ Download** tab, tap **📷 Scan QR** and point your camera at the Q
 - Actions need the key in a special header that other websites can't send, so a malicious site can't silently control Shardrip in the background. The page also rejects requests made through a different web address (DNS-rebinding protection).
 - With `--lan`, **anyone who has the link can control Shardrip on that machine**, including choosing files to share. Only use it on your own network and don't share that link.
 
+## 📱 Android app (Shardrip.apk)
+
+Every [release](../../releases/latest) includes **`Shardrip.apk`**, built and tested on an Android emulator by GitHub Actions. No Termux, no Python, no browser.
+
+1. On your phone, open the release page and tap **Shardrip.apk**.
+2. Android asks to allow installing from your browser: **Settings → Allow from this source**, then **Install**.
+3. Open **Shardrip**: paste a link, **📷 Scan QR**, or **🖼 Upload QR image**, type the password if it's locked, and press **Start download**.
+
+- **Smart links work**: on the sender's Wi-Fi it downloads directly at full speed, elsewhere over the internet.
+- **Keeps going in the background**: a "Shardrip - downloading" notification shows progress, and the phone stays awake until it's done.
+- Files save to your phone's **Download** folder.
+- **Share a link to Shardrip** from WhatsApp/Chrome (Share → Shardrip) and it fills itself in.
+- Version 1 is **download-only**. To *send* from a phone, use Termux (below).
+- Needs Android 8+ on a 64-bit phone (nearly every phone from the last 7+ years). Not on the Play Store, so Play Protect may warn about an unknown app.
+
 ## 📱 Android (Termux)
 
-Shardrip runs on Android inside **Termux**. Use the **web interface** there: the window version needs a desktop.
+Shardrip also runs on Android inside **Termux** (this way can also **send** files). Use the **web interface** there: the window version needs a desktop.
 
 1. Install **Termux from F-Droid** (f-droid.org), **not the Play Store**. The Play Store version is outdated.
 2. In Termux:
